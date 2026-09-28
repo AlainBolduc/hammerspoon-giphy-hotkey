@@ -62,7 +62,11 @@ fi
 
 # --- Reload Hammerspoon ---
 if pgrep -q Hammerspoon; then
-  osascript -e 'tell application "Hammerspoon" to execute lua code "hs.reload()"' 2>/dev/null || true
+  if command -v hs >/dev/null 2>&1; then
+    hs -c "hs.reload()" 2>/dev/null || true
+  else
+    osascript -e 'tell application "Hammerspoon" to execute lua code "hs.reload()"' 2>/dev/null || true
+  fi
 else
   open -a Hammerspoon
 fi
@@ -71,10 +75,14 @@ cat <<EOF
 
 Installed: $HAMMERSPOON_GIPHY
 
-Usage: Press ⌘⇧G anywhere (Slack, TextEdit, etc.) to search Giphy:
-  1. Type your search query
-  2. Browse the animated carousel (← Précédent / Suivant →)
-  3. Click "Poster" to insert the link, "Annuler" to cancel
+Usage: Press ⌘⇧G anywhere (Slack, TextEdit, etc.) to open Giphy:
+  1. Window opens directly with search bar focused (no default images)
+  2. Type query and press Enter (↵) to search (loads 25 GIFs)
+  3. Press Enter (↵) again to cycle to the Next GIF!
+  4. Press ⌘← to go back to any previous GIF
+  5. Press ⇧↵ (or ⌘↵ / "Poster") to insert the short link into active app
+  6. Click image or press ⌘C to copy the short link & close
+  7. Modifying text and pressing Enter (↵) launches a new search
 
 Note: Hammerspoon needs Accessibility permission (System Settings > Privacy &
 Security > Accessibility) to inject text into other apps.

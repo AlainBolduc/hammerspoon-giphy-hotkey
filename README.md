@@ -1,19 +1,21 @@
 # giphy
 
 Press **⌘⇧G** anywhere on macOS (Slack, Teams, iMessage, email…) to search Giphy,
-preview animated results in a native carousel, and insert the link you pick.
+preview animated results in a native carousel, and insert or copy the short link you pick.
 
 No automatic NSFW filtering: the animated preview is the filter, left to you
-before you click "Poster".
+before you click "Poster" or "Copier".
 
 ## How it works
 
 [Hammerspoon](https://www.hammerspoon.org/) binds **⌘⇧G** globally. When pressed:
-- Shows a text-input dialog for your search query
-- Searches Giphy API
-- Displays 5 results in an animated WKWebView carousel
-- Navigation: ← Précédent / Suivant → (or arrow keys), Enter to post, Esc to cancel
-- On "Poster": restores keyboard focus to the app you were using, then injects the link via `hs.eventtap.keyStrokes()`
+- Opens the native 2026 WKWebView window immediately with cursor focused in the search bar (no default images loaded)
+- **Enter in search bar**: launches search on first press; advances to the **Next GIF** on subsequent presses if text hasn't changed. Modifying the text and pressing Enter starts a new search!
+- **⌘← / ⌘→** (or arrow keys): navigate back and forth continuously through all 25 GIFs
+- **⌘R**: re-fetches a fresh randomized batch of 25 results
+- **⌘C** (or click image / "Copier"): copies the short link (`http://gph.is/...`) to clipboard and closes window
+- **Shift + Enter** (or Cmd + Enter): inserts the short link (`http://gph.is/...`) at the cursor into your active app (**Poster**)
+- **Esc**: clears search text or cancels/closes window
 
 ## Install
 
@@ -42,12 +44,13 @@ plain text. Re-run `./install.sh` any time to replace a stored key.
 
 ## Usage
 
-Press **⌘⇧G** and type your search. The carousel appears in ~200ms (network
-time). Browse with arrow keys or buttons, then:
-- **Poster** (or Enter) → inserts the link into your current app
-- **Suivant** (or →) → next result
-- **Précédent** (or ←) → previous result
-- **Annuler** (or Esc) → close without inserting
+Press **⌘⇧G** to pop the Giphy window directly:
+- **Enter** → 1ère fois : lance la recherche. Fois suivantes : fait défiler (**Next**). Si vous modifiez le texte : relance une nouvelle recherche !
+- **⌘←** (ou bouton Précédent) → reculer dans les GIFs trouvés
+- **⇧↵** (Shift + Enter) → insère le lien court dans votre application (**Poster**)
+- **⌘C** (ou clic sur le GIF / bouton « Copier ») → copie l'URL courte et ferme la fenêtre
+- **⌘R** → tire 25 nouveaux GIFs aléatoires
+- **Esc** → efface le texte ou ferme la fenêtre
 
 ## Permissions
 
