@@ -21,7 +21,7 @@ fi
 
 # --- Install Hammerspoon giphy module ---
 mkdir -p "$HAMMERSPOON_DIR"
-cp "$REPO_DIR/hammerspoon/giphy.lua" "$HAMMERSPOON_GIPHY"
+ln -sf "$REPO_DIR/hammerspoon/giphy.lua" "$HAMMERSPOON_GIPHY"
 
 # --- Ensure init.lua loads giphy ---
 INIT_LUA="$HAMMERSPOON_DIR/init.lua"
@@ -83,6 +83,7 @@ Usage: Press ⌘⇧G anywhere (Slack, TextEdit, etc.) to open Giphy:
   5. Press ⇧↵ (or ⌘↵ / "Poster") to insert the short link into active app
   6. Click image or press ⌘C to copy the short link & close
   7. Modifying text and pressing Enter (↵) launches a new search
+  8. Click ⚙️ (or press ⌘,) to configure API key, hotkey, or console logging
 
 Note: Hammerspoon needs Accessibility permission (System Settings > Privacy &
 Security > Accessibility) to inject text into other apps.

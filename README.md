@@ -8,14 +8,15 @@ before you click "Poster" or "Copier".
 
 ## How it works
 
-[Hammerspoon](https://www.hammerspoon.org/) binds **⌘⇧G** globally. When pressed:
+[Hammerspoon](https://www.hammerspoon.org/) binds **⌘⇧G** globally (customizable in settings). When pressed:
 - Opens the native 2026 WKWebView window immediately with cursor focused in the search bar (no default images loaded)
 - **Enter in search bar**: launches search on first press; advances to the **Next GIF** on subsequent presses if text hasn't changed. Modifying the text and pressing Enter starts a new search!
 - **⌘← / ⌘→** (or arrow keys): navigate back and forth continuously through all 25 GIFs
 - **⌘R**: re-fetches a fresh randomized batch of 25 results
 - **⌘C** (or click image / "Copier"): copies the short link (`http://gph.is/...`) to clipboard and closes window
 - **Shift + Enter** (or Cmd + Enter): inserts the short link (`http://gph.is/...`) at the cursor into your active app (**Poster**)
-- **Esc**: clears search text or cancels/closes window
+- **⚙️ (or ⌘,)**: opens the Settings panel to toggle console logging, update your Giphy API key, or customize the global shortcut
+- **Esc**: closes the settings panel (if open), clears search text, or cancels/closes the window
 
 ## Install
 
@@ -38,19 +39,29 @@ You need a free Giphy API key. Get one at [developers.giphy.com/dashboard](https
 2. Create an app
 3. Copy the API key from your app dashboard
 
-`install.sh` prompts for it and stores it in the macOS Keychain (service
-`giphy-hammerspoon`, account = your username) — nothing is written to disk in
-plain text. Re-run `./install.sh` any time to replace a stored key.
+You can enter or update your API key in two ways:
+- **Directly in the app UI**: Click the ⚙️ gear icon (or press **⌘,**) to open the settings panel and enter your key. It will be securely stored in the macOS Keychain.
+- **Via install script**: `install.sh` stores it in the macOS Keychain (service `giphy-hammerspoon`, account = your username).
+
+### Settings Panel (⚙️ or ⌘,)
+- **Hammerspoon Console Logging**: Toggle high-precision debug & performance timing logs in the Hammerspoon Console (also written with millisecond timestamps to `~/.giphy-hammerspoon.log`).
+  - **Window Startup**: Keychain lookup time, WKWebView creation time, and time until window is interactive and ready for input (`~60-200ms`).
+  - **Giphy API**: HTTP request duration, payload size in KB, JSON parsing and candidate shuffle time, and Webview injection time.
+  - **Image Rendering**: GIF preview load time, dimensions, and cache hit status.
+  - **Action Execution**: Keystroke injection timing into the active application and total session duration.
+- **Giphy API Key**: Update your API key with a visibility toggle; saved securely into macOS Keychain.
+- **Global Keyboard Shortcut**: Customize using clickable modifier chips (⌘, ⇧, ⌥, ⌃), a key dropdown, or click "Enregistrer en tapant..." to record any shortcut directly (e.g., `⌘⇧G`, `⌘⌥Space`, `⌃Space`). Applied instantly without restarting Hammerspoon.
 
 ## Usage
 
-Press **⌘⇧G** to pop the Giphy window directly:
+Press **⌘⇧G** (or your custom shortcut) to pop the Giphy window directly:
 - **Enter** → 1ère fois : lance la recherche. Fois suivantes : fait défiler (**Next**). Si vous modifiez le texte : relance une nouvelle recherche !
 - **⌘←** (ou bouton Précédent) → reculer dans les GIFs trouvés
 - **⇧↵** (Shift + Enter) → insère le lien court dans votre application (**Poster**)
 - **⌘C** (ou clic sur le GIF / bouton « Copier ») → copie l'URL courte et ferme la fenêtre
 - **⌘R** → tire 25 nouveaux GIFs aléatoires
-- **Esc** → efface le texte ou ferme la fenêtre
+- **⚙️** (ou **⌘,**) → ouvre la fenêtre de configuration
+- **Esc** → ferme les paramètres ou efface le texte / ferme la fenêtre
 
 ## Permissions
 
