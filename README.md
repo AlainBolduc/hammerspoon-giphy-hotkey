@@ -10,12 +10,20 @@ before you click "Poster" or "Copier".
 
 [Hammerspoon](https://www.hammerspoon.org/) binds **⌘⇧G** globally (customizable in settings). When pressed:
 - Opens the native 2026 WKWebView window immediately with cursor focused in the search bar (no default images loaded)
+- **Deux modes d'affichage au choix** :
+  - **Mode Galerie (⊞ / ⌘1)** : grille de 5 colonnes de large sur 3 rangées visibles, avec défilement continu. Au survol de chaque vignette, deux boutons d'action rapide apparaissent :
+    - 🟢 **Copier** (vert) : copie le lien court et ferme la fenêtre
+    - 🟣 **Poster** (mauve) : injecte le lien court directement dans votre application active et ferme la fenêtre
+    - Double-clic (ou Espace) sur une vignette : ouvre le GIF en plein format dans le mode Carrousel
+  - **Mode Carrousel (🗂 / ⌘2)** : affichage grand format d'un GIF à la fois avec navigation pas-à-pas
+- **Scroll infini (Infinite Scroll)** : en mode Galerie (ou à la fin du carrousel), dès que vous atteignez le bas de la liste, 25 nouveaux GIFs sont automatiquement chargés et ajoutés sans doublon
+- **Bascule rapide de mode** : boutons dédiés dans l'en-tête, ou raccourcis **⌘1** (Galerie), **⌘2** (Carrousel), **⌘M** (bascule)
 - **Enter in search bar**: launches search on first press; advances to the **Next GIF** on subsequent presses if text hasn't changed. Modifying the text and pressing Enter starts a new search!
-- **⌘← / ⌘→** (or arrow keys): navigate back and forth continuously through all 25 GIFs
-- **⌘R**: re-fetches a fresh randomized batch of 25 results
+- **⌘← / ⌘→** (ou flèches clavier) : naviguer dans les GIFs trouvés (déplacement 5x3 dans la grille en mode Galerie)
+- **⌘R**: re-fetches a fresh randomized batch of results
 - **⌘C** (or click image / "Copier"): copies the short link (`http://gph.is/...`) to clipboard and closes window
 - **Shift + Enter** (or Cmd + Enter): inserts the short link (`http://gph.is/...`) at the cursor into your active app (**Poster**)
-- **⚙️ (or ⌘,)**: opens the Settings panel to toggle console logging, update your Giphy API key, or customize the global shortcut
+- **⚙️ (or ⌘,)**: opens the Settings panel to toggle console logging, update your Giphy API key, choose your default view mode, or customize the global shortcut
 - **Esc**: closes the settings panel (if open), clears search text, or cancels/closes the window
 
 ## Install
@@ -44,9 +52,10 @@ You can enter or update your API key in two ways:
 - **Via install script**: `install.sh` stores it in the macOS Keychain (service `giphy-hammerspoon`, account = your username).
 
 ### Settings Panel (⚙️ or ⌘,)
+- **Mode d'affichage par défaut** : Définissez si l'application s'ouvre par défaut en mode Galerie (grille) ou Carrousel (1 GIF).
 - **Hammerspoon Console Logging**: Toggle high-precision debug & performance timing logs in the Hammerspoon Console (also written with millisecond timestamps to `~/.giphy-hammerspoon.log`).
   - **Window Startup**: Keychain lookup time, WKWebView creation time, and time until window is interactive and ready for input (`~60-200ms`).
-  - **Giphy API**: HTTP request duration, payload size in KB, JSON parsing and candidate shuffle time, and Webview injection time.
+  - **Giphy API**: HTTP request duration, payload size in KB, JSON parsing time, and Webview injection time.
   - **Image Rendering**: GIF preview load time, dimensions, and cache hit status.
   - **Action Execution**: Keystroke injection timing into the active application and total session duration.
 - **Giphy API Key**: Update your API key with a visibility toggle; saved securely into macOS Keychain.
@@ -56,10 +65,13 @@ You can enter or update your API key in two ways:
 
 Press **⌘⇧G** (or your custom shortcut) to pop the Giphy window directly:
 - **Enter** → 1ère fois : lance la recherche. Fois suivantes : fait défiler (**Next**). Si vous modifiez le texte : relance une nouvelle recherche !
-- **⌘←** (ou bouton Précédent) → reculer dans les GIFs trouvés
+- **⌘1 / ⌘2 / ⌘M** → basculer entre vue Galerie (5 colonnes) et vue Carrousel (1 GIF)
+- **Survol vignette (Galerie)** → boutons rapides 🟢 **Copier** et 🟣 **Poster**
+- **Défilement bas de page** → chargement infini automatique (+25 GIFs par page)
+- **⌘← / ⌘→** (ou flèches clavier) → naviguer dans les GIFs trouvés
 - **⇧↵** (Shift + Enter) → insère le lien court dans votre application (**Poster**)
 - **⌘C** (ou clic sur le GIF / bouton « Copier ») → copie l'URL courte et ferme la fenêtre
-- **⌘R** → tire 25 nouveaux GIFs aléatoires
+- **⌘R** → tire de nouveaux GIFs aléatoires
 - **⚙️** (ou **⌘,**) → ouvre la fenêtre de configuration
 - **Esc** → ferme les paramètres ou efface le texte / ferme la fenêtre
 

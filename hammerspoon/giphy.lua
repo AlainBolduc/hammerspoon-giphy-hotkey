@@ -11,10 +11,11 @@ local KEYCHAIN_ACCOUNT = os.getenv("USER")
 local RESULT_LIMIT = 25
 local POOL_SIZE = 50
 local MAX_RANDOM_OFFSET = 35
-local WINDOW_SIZE = { w = 480, h = 570 }
+local WINDOW_SIZE = { w = 740, h = 580 }
 
 local SETTINGS_KEY_CONSOLE_LOG = "giphy.consoleLogging"
 local SETTINGS_KEY_HOTKEY = "giphy.hotkey"
+local SETTINGS_KEY_DEFAULT_VIEW = "giphy.defaultView"
 local DEFAULT_HOTKEY = { mods = { "cmd", "shift" }, key = "g" }
 
 local cachedApiKey = nil
@@ -22,6 +23,14 @@ local currentSessionStart = nil
 
 local function isConsoleLogging()
     return hs.settings.get(SETTINGS_KEY_CONSOLE_LOG) == true
+end
+
+local function getDefaultViewMode()
+    local saved = hs.settings.get(SETTINGS_KEY_DEFAULT_VIEW)
+    if saved == "carousel" or saved == "gallery" then
+        return saved
+    end
+    return "gallery"
 end
 
 local function getTimestamp()
@@ -199,6 +208,17 @@ local function closePreview()
 end
 
 local function pickPreview(images)
+    local keys = { "fixed_height", "downsized", "downsized_medium", "downsized_large", "original" }
+    for _, k in ipairs(keys) do
+        local img = images[k]
+        if img and img.url and img.url ~= "" then
+            return img.url
+        end
+    end
+    return nil
+end
+
+local function pickLarge(images)
     local keys = { "downsized_large", "downsized_medium", "original", "downsized", "fixed_height" }
     for _, k in ipairs(keys) do
         local img = images[k]
@@ -209,7 +229,16 @@ local function pickPreview(images)
     return nil
 end
 
-local function fetchGifs(query, apiKey, callback)
+local currentSearchBaseOffset = 0
+
+local function fetchGifs(query, apiKey, offset, callback)
+    if type(offset) == "function" then
+        callback = offset
+        offset = 0
+    end
+    offset = tonumber(offset) or 0
+    local isInitial = (offset == 0)
+
     local queryTrimmed = query and query:gsub("^%s+", ""):gsub("%s+$", "") or ""
     if queryTrimmed == "" then
         callback({}, nil)
@@ -217,13 +246,18 @@ local function fetchGifs(query, apiKey, callback)
     end
 
     local tFetchStart = hs.timer.absoluteTime()
-    local randomOffset = math.random(0, MAX_RANDOM_OFFSET)
+    if isInitial then
+        currentSearchBaseOffset = math.random(0, MAX_RANDOM_OFFSET)
+    end
+    local effectiveOffset = currentSearchBaseOffset + offset
+    local poolLimit = RESULT_LIMIT
+
     local baseUrl = "https://api.giphy.com/v1/gifs/search?api_key=" .. hs.http.encodeForQuery(apiKey)
         .. "&q=" .. hs.http.encodeForQuery(queryTrimmed)
-        .. "&limit=" .. POOL_SIZE
+        .. "&limit=" .. poolLimit
 
-    local urlWithOffset = baseUrl .. "&offset=" .. randomOffset
-    log(string.format("Giphy API request dispatch: offset=%d, pool=%d", randomOffset, POOL_SIZE))
+    local urlWithOffset = baseUrl .. "&offset=" .. effectiveOffset
+    log(string.format("Giphy API request dispatch: offset=%d (base=%d + %d), limit=%d", effectiveOffset, currentSearchBaseOffset, offset, poolLimit))
 
     local function parseAndCallback(body, httpDurationMs)
         local tParseStart = hs.timer.absoluteTime()
@@ -245,26 +279,22 @@ local function fetchGifs(query, apiKey, callback)
         if rawCount == 0 then
             local totalMs = (hs.timer.absoluteTime() - tFetchStart) / 1000000.0
             logTiming("Giphy returned 0 results", totalMs, "query: '" .. queryTrimmed .. "'")
-            callback({}, "Aucun résultat pour « " .. queryTrimmed .. " »")
+            callback({}, isInitial and ("Aucun résultat pour « " .. queryTrimmed .. " »") or nil)
             return
-        end
-
-        -- Fisher-Yates shuffle on the candidate pool for randomized diversity
-        for i = rawCount, 2, -1 do
-            local j = math.random(i)
-            data[i], data[j] = data[j], data[i]
         end
 
         local results = {}
         for _, gif in ipairs(data) do
             local images = gif.images or {}
             local preview = pickPreview(images)
+            local large = pickLarge(images)
             if preview then
                 local short = (gif.bitly_gif_url and gif.bitly_gif_url ~= "" and gif.bitly_gif_url)
                     or (gif.bitly_url and gif.bitly_url ~= "" and gif.bitly_url)
                     or gif.url
                 table.insert(results, {
                     previewUrl = preview,
+                    largeUrl = large or preview,
                     shortUrl = short,
                     pageUrl = gif.url,
                     title = gif.title or "",
@@ -278,7 +308,7 @@ local function fetchGifs(query, apiKey, callback)
         local parseDurationMs = (hs.timer.absoluteTime() - tParseStart) / 1000000.0
         local totalFetchMs = (hs.timer.absoluteTime() - tFetchStart) / 1000000.0
 
-        logTiming("Giphy JSON parsed & shuffled", parseDurationMs, string.format("%d pool -> %d results", rawCount, #results))
+        logTiming("Giphy JSON parsed", parseDurationMs, string.format("%d raw -> %d results", rawCount, #results))
         logTiming("Total Giphy API fetch duration", totalFetchMs, string.format("HTTP: %s", formatDuration(httpDurationMs)))
 
         callback(results, nil)
@@ -294,8 +324,9 @@ local function fetchGifs(query, apiKey, callback)
             local ok, decoded = pcall(hs.json.decode, body)
             local data = (ok and decoded and decoded.data) or {}
             -- If random offset produced 0 items, fallback to offset 0
-            if #data == 0 and randomOffset > 0 then
-                log(string.format("Offset %d returned 0 items, retrying with offset 0...", randomOffset))
+            if #data == 0 and isInitial and currentSearchBaseOffset > 0 then
+                log(string.format("Base offset %d returned 0 items, retrying with offset 0...", currentSearchBaseOffset))
+                currentSearchBaseOffset = 0
                 local tRetryStart = hs.timer.absoluteTime()
                 hs.http.asyncGet(baseUrl .. "&offset=0", nil, function(status2, body2)
                     local retryHttpDurationMs = (hs.timer.absoluteTime() - tRetryStart) / 1000000.0
@@ -450,8 +481,59 @@ local function buildHtml(initialConfig)
     flex-shrink: 0;
   }
 
-  /* Viewport & Carousel */
+  /* View Mode Switcher */
+  .view-toggle-group {
+    display: inline-flex;
+    align-items: center;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 2px;
+    gap: 2px;
+    flex-shrink: 0;
+  }
+  .view-toggle-btn {
+    appearance: none;
+    -webkit-appearance: none;
+    border: none;
+    outline: none;
+    background: transparent;
+    color: var(--text-muted);
+    padding: 3px 6px;
+    border-radius: 6px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s ease;
+  }
+  .view-toggle-btn:hover {
+    color: var(--text-primary);
+  }
+  .view-toggle-btn.active {
+    background: linear-gradient(135deg, rgba(99, 102, 241, 0.45) 0%, rgba(79, 70, 229, 0.65) 100%);
+    color: #ffffff;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+  }
+
+  /* Viewport & View Panels */
   #viewport {
+    flex: 1;
+    min-height: 0;
+    position: relative;
+    overflow: hidden;
+    display: flex;
+  }
+  .view-panel {
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    position: relative;
+    display: flex;
+  }
+
+  /* Mode 1: Carousel */
+  #carousel-view {
     flex: 1;
     min-height: 0;
     position: relative;
@@ -473,7 +555,7 @@ local function buildHtml(initialConfig)
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 8px 16px;
+    padding: 10px 20px;
     box-sizing: border-box;
     cursor: pointer;
   }
@@ -481,6 +563,8 @@ local function buildHtml(initialConfig)
     position: relative;
     width: 100%;
     height: 100%;
+    max-width: 580px;
+    max-height: 440px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -508,6 +592,176 @@ local function buildHtml(initialConfig)
   }
   .card:hover img {
     transform: scale(1.015);
+  }
+
+  /* Mode 2: Gallery Grid (5 wide, 3 rows high, scroll for more) */
+  #gallery-view {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 12px 14px 16px;
+    box-sizing: border-box;
+    scroll-behavior: smooth;
+    -webkit-overflow-scrolling: touch;
+    display: flex;
+    flex-direction: column;
+  }
+  #gallery-view::-webkit-scrollbar {
+    width: 6px;
+  }
+  #gallery-view::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  #gallery-view::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.16);
+    border-radius: 999px;
+  }
+  #gallery-view::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.3);
+  }
+
+  .gallery-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .gallery-card {
+    position: relative;
+    border-radius: 9px;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid var(--border-subtle);
+    aspect-ratio: 4 / 3;
+    cursor: pointer;
+    transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    user-select: none;
+    -webkit-user-select: none;
+    outline: none;
+  }
+  .gallery-card:hover, .gallery-card:focus-visible, .gallery-card.selected {
+    transform: translateY(-2px);
+    border-color: rgba(99, 102, 241, 0.85);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(99, 102, 241, 0.4);
+    z-index: 2;
+  }
+  .gallery-img-wrapper {
+    width: 100%;
+    height: 100%;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .gallery-card img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    transition: transform 0.22s ease;
+  }
+  .gallery-card:hover img {
+    transform: scale(1.05);
+  }
+
+  /* Card Hover Overlay & Action Buttons */
+  .gallery-card-overlay {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(to top, rgba(12, 14, 18, 0.94) 0%, rgba(12, 14, 18, 0.45) 55%, transparent 100%);
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    padding: 5px;
+    box-sizing: border-box;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.16s ease;
+  }
+  .gallery-card:hover .gallery-card-overlay,
+  .gallery-card:focus-visible .gallery-card-overlay,
+  .gallery-card.selected .gallery-card-overlay {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .gallery-card-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+  }
+
+  .gallery-btn {
+    flex: 1;
+    padding: 4px 5px;
+    font-size: 10px;
+    font-weight: 600;
+    border-radius: 6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    cursor: pointer;
+    border: none;
+    outline: none;
+    color: white;
+    transition: all 0.14s ease;
+    white-space: nowrap;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+  }
+  /* Vert / Green - Copier */
+  .gallery-btn-copy {
+    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+    box-shadow: 0 2px 6px rgba(16, 185, 129, 0.35);
+  }
+  .gallery-btn-copy:hover {
+    background: linear-gradient(135deg, #059669 0%, #047857 100%);
+    box-shadow: 0 3px 10px rgba(16, 185, 129, 0.5);
+    transform: translateY(-1px);
+  }
+  /* Mauve / Purple - Poster */
+  .gallery-btn-post {
+    background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+    box-shadow: 0 2px 6px rgba(99, 102, 241, 0.35);
+  }
+  .gallery-btn-post:hover {
+    background: linear-gradient(135deg, #4f46e5 0%, #4338ca 100%);
+    box-shadow: 0 3px 10px rgba(99, 102, 241, 0.5);
+    transform: translateY(-1px);
+  }
+
+  .gallery-loading-more {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 16px 0 10px;
+    color: var(--text-secondary);
+    font-size: 11.5px;
+    font-weight: 500;
+  }
+  .spinner-sm {
+    width: 12px;
+    height: 12px;
+    border: 2px solid rgba(255, 255, 255, 0.2);
+    border-top-color: #818cf8;
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+    flex-shrink: 0;
+  }
+  .gallery-end-msg {
+    text-align: center;
+    padding: 14px 0 8px;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 500;
   }
 
   .copy-pill {
@@ -1066,6 +1320,14 @@ local function buildHtml(initialConfig)
       <div id="spinner" class="spinner" style="display: none;"></div>
     </div>
     <div class="header-right">
+      <div class="view-toggle-group">
+        <button id="view-btn-gallery" class="view-toggle-btn active" title="Vue Galerie (⌘1)" type="button">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+        </button>
+        <button id="view-btn-carousel" class="view-toggle-btn" title="Vue Carrousel (⌘2)" type="button">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+        </button>
+      </div>
       <div class="counter-badge" id="counter" style="display: none;">0 / 0</div>
       <button id="gear-btn" class="icon-btn gear-btn" title="Paramètres (⌘,)" aria-label="Paramètres">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
@@ -1073,7 +1335,22 @@ local function buildHtml(initialConfig)
     </div>
   </header>
   <main id="viewport">
-    <div id="track"></div>
+    <!-- Mode 1: Carrousel (1 GIF à la fois) -->
+    <div id="carousel-view" style="display: none;">
+      <div id="track"></div>
+    </div>
+
+    <!-- Mode 2: Galerie (5 colonnes x 3 rangées visibles, scroll) -->
+    <div id="gallery-view">
+      <div id="gallery-grid" class="gallery-grid"></div>
+      <div id="gallery-loading-more" class="gallery-loading-more" style="display: none;">
+        <div class="spinner-sm"></div>
+        <span>Chargement de plus de GIFs...</span>
+      </div>
+      <div id="gallery-end-msg" class="gallery-end-msg" style="display: none;">
+        <span>Fin des résultats</span>
+      </div>
+    </div>
 
     <!-- Welcome state (initial start with no image) -->
     <div id="welcome-state" class="state-container">
@@ -1085,10 +1362,10 @@ local function buildHtml(initialConfig)
       <div class="state-sub">Tapez votre recherche et appuyez sur <span class="kbd">↵</span></div>
       <div class="shortcuts-legend">
         <span><span class="kbd">↵</span> Chercher / Suivant</span>
-        <span><span class="kbd">⌘←</span> Reculer</span>
-        <span><span class="kbd">⌘R</span> Mélanger</span>
+        <span><span class="kbd">⌘1 / ⌘2</span> Galerie / Carrousel</span>
         <span><span class="kbd">⌘C</span> Copier</span>
         <span><span class="kbd">⇧↵</span> Poster</span>
+        <span><span class="kbd">⌘R</span> Mélanger</span>
       </div>
     </div>
 
@@ -1137,6 +1414,18 @@ local function buildHtml(initialConfig)
     </div>
 
     <div class="settings-content">
+      <!-- Setting 0: Default view mode -->
+      <div class="setting-card">
+        <div class="setting-info">
+          <label for="cfg-defaultview" class="setting-label">Mode d'affichage par défaut</label>
+          <div class="setting-desc">Vue par défaut à l'ouverture (Galerie ou Carrousel)</div>
+        </div>
+        <select id="cfg-defaultview" class="hotkey-select" style="min-width: 125px;">
+          <option value="gallery">Galerie (grille)</option>
+          <option value="carousel">Carrousel (1 GIF)</option>
+        </select>
+      </div>
+
       <!-- Setting 1: Console logging -->
       <div class="setting-card">
         <div class="setting-info">
@@ -1216,7 +1505,8 @@ local function buildHtml(initialConfig)
   let activeConfig = window.__INITIAL_CONFIG__ || {
     consoleLogging: false,
     apiKey: '',
-    hotkey: { mods: ['cmd', 'shift'], key: 'g' }
+    hotkey: { mods: ['cmd', 'shift'], key: 'g' },
+    defaultView: 'gallery'
   };
   let pendingHotkey = Object.assign({}, activeConfig.hotkey);
   let isRecordingHotkey = false;
@@ -1227,6 +1517,9 @@ local function buildHtml(initialConfig)
   let copying = false;
   let lastSearchedQuery = '';
   let isSearching = false;
+  let isLoadingMore = false;
+  let hasMore = true;
+  let viewMode = (activeConfig.defaultView === 'carousel') ? 'carousel' : 'gallery';
   const reportedImages = new Set();
 
   function reportImageTiming(idx, loadMs, imgEl, fromCache) {
@@ -1267,6 +1560,165 @@ local function buildHtml(initialConfig)
   const nextBtn = document.getElementById('next');
   const copyBtn = document.getElementById('copy');
   const postBtn = document.getElementById('post');
+  const carouselView = document.getElementById('carousel-view');
+  const galleryView = document.getElementById('gallery-view');
+  const galleryGrid = document.getElementById('gallery-grid');
+  const galleryLoadingMore = document.getElementById('gallery-loading-more');
+  const galleryEndMsg = document.getElementById('gallery-end-msg');
+  const viewBtnGallery = document.getElementById('view-btn-gallery');
+  const viewBtnCarousel = document.getElementById('view-btn-carousel');
+
+  function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/[&<>"']/g, function(m) {
+      switch (m) {
+        case '&': return '&amp;';
+        case '<': return '&lt;';
+        case '>': return '&gt;';
+        case '"': return '&quot;';
+        case "'": return '&#039;';
+        default: return m;
+      }
+    });
+  }
+
+  function setViewMode(mode, savePref = true) {
+    if (mode !== 'carousel' && mode !== 'gallery') return;
+    viewMode = mode;
+    if (viewMode === 'gallery') {
+      viewBtnGallery.classList.add('active');
+      viewBtnCarousel.classList.remove('active');
+      if (results.length > 0) {
+        carouselView.style.display = 'none';
+        galleryView.style.display = 'flex';
+        selectCard(index, false);
+      }
+    } else {
+      viewBtnCarousel.classList.add('active');
+      viewBtnGallery.classList.remove('active');
+      if (results.length > 0) {
+        galleryView.style.display = 'none';
+        carouselView.style.display = 'flex';
+        renderCarousel();
+      }
+    }
+    updateControlsUI();
+    if (savePref) {
+      try {
+        localStorage.setItem('giphy_view_mode', mode);
+        window.webkit.messageHandlers.giphyBridge.postMessage({
+          action: 'setDefaultView',
+          mode: mode
+        });
+      } catch(e) {}
+    }
+  }
+
+  viewBtnGallery.addEventListener('click', () => setViewMode('gallery'));
+  viewBtnCarousel.addEventListener('click', () => setViewMode('carousel'));
+
+  function createGalleryCard(gif, idx) {
+    const card = document.createElement('div');
+    card.className = 'gallery-card' + (idx === index ? ' selected' : '');
+    card.dataset.index = idx;
+    card.tabIndex = -1;
+
+    card.innerHTML = `
+      <div class="gallery-img-wrapper">
+        <img src="${gif.previewUrl}" alt="${escapeHtml(gif.title || 'GIF')}" loading="lazy">
+      </div>
+      <div class="gallery-card-overlay">
+        <div class="gallery-card-actions">
+          <button type="button" class="gallery-btn gallery-btn-copy" title="Copier le lien court (⌘C)">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            <span>Copier</span>
+          </button>
+          <button type="button" class="gallery-btn gallery-btn-post" title="Poster directement (⇧↵)">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+            <span>Poster</span>
+          </button>
+        </div>
+      </div>
+      <div class="copied-flash">
+        <div class="copied-flash-box" style="padding: 6px 12px; font-size: 11px;">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+          <span>Copié !</span>
+        </div>
+      </div>
+    `;
+
+    const copyBtn = card.querySelector('.gallery-btn-copy');
+    const postBtn = card.querySelector('.gallery-btn-post');
+
+    copyBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      triggerCopy(idx);
+    });
+
+    postBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      triggerPost(idx);
+    });
+
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('.gallery-btn')) return;
+      selectCard(idx);
+      triggerCopy(idx);
+    });
+
+    card.addEventListener('dblclick', (e) => {
+      e.stopPropagation();
+      index = idx;
+      setViewMode('carousel');
+    });
+
+    return card;
+  }
+
+  function createCarouselSlide(gif, idx) {
+    const slide = document.createElement('div');
+    slide.className = 'slide';
+    slide.dataset.index = idx;
+    const srcAttr = (idx <= 2) ? `src="${gif.largeUrl || gif.previewUrl}"` : '';
+    slide.innerHTML = `
+      <div class="card">
+        <img ${srcAttr} data-src="${gif.largeUrl || gif.previewUrl}" alt="gif ${idx + 1}">
+        <div class="copy-pill">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+          <span>Cliquer pour copier</span>
+        </div>
+        <div class="copied-flash">
+          <div class="copied-flash-box">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+            <span>Lien court copié !</span>
+          </div>
+        </div>
+      </div>`;
+
+    const card = slide.querySelector('.card');
+    card.onclick = () => triggerCopy(idx);
+    return slide;
+  }
+
+  function selectCard(idx, scrollIntoView = false) {
+    if (idx < 0) idx = 0;
+    if (idx >= results.length) idx = results.length - 1;
+    index = idx;
+
+    const cards = galleryGrid.querySelectorAll('.gallery-card');
+    cards.forEach((c, i) => {
+      if (i === index) {
+        c.classList.add('selected');
+        if (scrollIntoView) {
+          c.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
+        }
+      } else {
+        c.classList.remove('selected');
+      }
+    });
+
+    updateControlsUI();
+  }
 
   function watchSlideImage(idx) {
     if (reportedImages.has(idx)) return;
@@ -1298,7 +1750,7 @@ local function buildHtml(initialConfig)
       (index - 2 + total) % total
     ];
     indices.forEach(idx => {
-      const slide = document.querySelector(`.slide[data-index="${idx}"]`);
+      const slide = track.querySelector(`.slide[data-index="${idx}"]`);
       if (slide) {
         const img = slide.querySelector('img');
         if (img && !img.src && img.dataset.src) {
@@ -1308,24 +1760,22 @@ local function buildHtml(initialConfig)
     });
   }
 
-  function goPrev() {
-    if (results.length > 1) {
-      index = (index - 1 + results.length) % results.length;
-      render();
-    }
+  function renderCarousel() {
+    const total = results.length;
+    if (total === 0) return;
+    if (index >= total) index = total - 1;
+    if (index < 0) index = 0;
+
+    track.style.display = 'flex';
+    track.style.transform = `translateX(${-index * 100}%)`;
+    updatePreloads();
+    watchSlideImage(index);
+    updateControlsUI();
   }
 
-  function goNext() {
-    if (results.length > 1) {
-      index = (index + 1) % results.length;
-      render();
-    }
-  }
-
-  function render() {
+  function updateControlsUI() {
     const total = results.length;
     if (total === 0) {
-      track.style.display = 'none';
       counter.style.display = 'none';
       prevBtn.disabled = true;
       nextBtn.disabled = true;
@@ -1334,78 +1784,156 @@ local function buildHtml(initialConfig)
       return;
     }
 
-    welcomeState.style.display = 'none';
-    emptyState.style.display = 'none';
-    track.style.display = 'flex';
     counter.style.display = 'inline-flex';
+    counter.textContent = (index + 1) + ' / ' + total;
     copyBtn.disabled = false;
     postBtn.disabled = false;
     prevBtn.disabled = total <= 1;
     nextBtn.disabled = total <= 1;
-
-    if (index >= total) index = total - 1;
-    if (index < 0) index = 0;
-
-    track.style.transform = `translateX(${-index * 100}%)`;
-    counter.textContent = (index + 1) + ' / ' + total;
-
-    updatePreloads();
-    watchSlideImage(index);
   }
 
-  function setResults(newResults, err) {
-    isSearching = false;
-    spinner.style.display = 'none';
-    clearBtn.style.display = input.value ? 'flex' : 'none';
-    reportedImages.clear();
+  function goPrev() {
+    if (results.length > 1) {
+      index = (index - 1 + results.length) % results.length;
+      if (viewMode === 'carousel') {
+        renderCarousel();
+      } else {
+        selectCard(index, true);
+      }
+    }
+  }
 
-    if (err || !newResults || newResults.length === 0) {
+  function goNext() {
+    if (results.length > 1) {
+      if (index >= results.length - 2 && hasMore && !isLoadingMore) {
+        loadMoreGifs();
+      }
+      index = (index + 1) % results.length;
+      if (viewMode === 'carousel') {
+        renderCarousel();
+      } else {
+        selectCard(index, true);
+      }
+    }
+  }
+
+  function loadMoreGifs() {
+    if (isLoadingMore || !hasMore || isSearching || !lastSearchedQuery) return;
+    isLoadingMore = true;
+    galleryLoadingMore.style.display = 'flex';
+    window.webkit.messageHandlers.giphyBridge.postMessage({
+      action: 'search',
+      query: lastSearchedQuery,
+      offset: results.length,
+      append: true,
+      seq: searchSeq
+    });
+  }
+
+  galleryView.addEventListener('scroll', () => {
+    if (viewMode !== 'gallery') return;
+    if (galleryView.scrollHeight - galleryView.scrollTop - galleryView.clientHeight < 140) {
+      loadMoreGifs();
+    }
+  });
+
+  function setResults(newResults, err, isAppend) {
+    isSearching = false;
+    isLoadingMore = false;
+    spinner.style.display = 'none';
+    galleryLoadingMore.style.display = 'none';
+    clearBtn.style.display = input.value ? 'flex' : 'none';
+
+    if (err) {
+      if (!isAppend) {
+        results = [];
+        lastSearchedQuery = '';
+        welcomeState.style.display = 'none';
+        emptyState.style.display = 'flex';
+        emptyMsg.textContent = err;
+        carouselView.style.display = 'none';
+        galleryView.style.display = 'none';
+        updateControlsUI();
+      }
+      return;
+    }
+
+    if (isAppend) {
+      if (!newResults || newResults.length === 0) {
+        hasMore = false;
+        galleryEndMsg.style.display = 'block';
+        return;
+      }
+      if (newResults.length < 25) {
+        hasMore = false;
+        galleryEndMsg.style.display = 'block';
+      }
+
+      const startIndex = results.length;
+      results = results.concat(newResults);
+
+      const gridFrag = document.createDocumentFragment();
+      for (let i = 0; i < newResults.length; i++) {
+        gridFrag.appendChild(createGalleryCard(newResults[i], startIndex + i));
+      }
+      galleryGrid.appendChild(gridFrag);
+
+      const trackFrag = document.createDocumentFragment();
+      for (let i = 0; i < newResults.length; i++) {
+        trackFrag.appendChild(createCarouselSlide(newResults[i], startIndex + i));
+      }
+      track.appendChild(trackFrag);
+
+      updateControlsUI();
+      if (viewMode === 'carousel') {
+        updatePreloads();
+      }
+      return;
+    }
+
+    if (!newResults || newResults.length === 0) {
       results = [];
       lastSearchedQuery = '';
       welcomeState.style.display = 'none';
       emptyState.style.display = 'flex';
-      emptyMsg.textContent = err || 'Aucun résultat';
-      render();
+      emptyMsg.textContent = 'Aucun résultat';
+      carouselView.style.display = 'none';
+      galleryView.style.display = 'none';
+      updateControlsUI();
       return;
     }
 
+    reportedImages.clear();
     results = newResults;
     index = 0;
+    hasMore = (results.length >= 25);
+    galleryEndMsg.style.display = 'none';
+    welcomeState.style.display = 'none';
+    emptyState.style.display = 'none';
 
-    let slidesHtml = '';
+    galleryGrid.innerHTML = '';
+    const gridFrag = document.createDocumentFragment();
     for (let i = 0; i < results.length; i++) {
-      const gif = results[i];
-      const srcAttr = (i <= 2) ? `src="${gif.previewUrl}"` : '';
-      slidesHtml += `
-        <div class="slide" data-index="${i}">
-          <div class="card">
-            <img ${srcAttr} data-src="${gif.previewUrl}" alt="gif ${i + 1}">
-            <div class="copy-pill">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-              <span>Cliquer pour copier</span>
-            </div>
-            <div class="copied-flash">
-              <div class="copied-flash-box">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                <span>Lien court copié !</span>
-              </div>
-            </div>
-          </div>
-        </div>`;
+      gridFrag.appendChild(createGalleryCard(results[i], i));
     }
+    galleryGrid.appendChild(gridFrag);
+    galleryView.scrollTop = 0;
 
-    track.innerHTML = slidesHtml;
+    track.innerHTML = '';
+    const trackFrag = document.createDocumentFragment();
+    for (let i = 0; i < results.length; i++) {
+      trackFrag.appendChild(createCarouselSlide(results[i], i));
+    }
+    track.appendChild(trackFrag);
 
-    document.querySelectorAll('.card').forEach((card) => {
-      card.onclick = () => triggerCopy(index);
-    });
-
-    render();
+    setViewMode(viewMode, false);
+    selectCard(0);
+    renderCarousel();
   }
 
-  window.onGiphyResults = function(data, err, seq) {
+  window.onGiphyResults = function(data, err, seq, isAppend) {
     if (seq !== searchSeq) return;
-    setResults(data, err);
+    setResults(data, err, isAppend === true || isAppend === 'true');
   };
 
   function doSearch() {
@@ -1417,15 +1945,28 @@ local function buildHtml(initialConfig)
     spinner.style.display = 'block';
     welcomeState.style.display = 'none';
     emptyState.style.display = 'none';
-    window.webkit.messageHandlers.giphyBridge.postMessage({action: 'search', query: q, seq: searchSeq});
+    window.webkit.messageHandlers.giphyBridge.postMessage({
+      action: 'search',
+      query: q,
+      offset: 0,
+      append: false,
+      seq: searchSeq
+    });
   }
 
   function triggerCopy(idx) {
     if (copying || !results[idx]) return;
     copying = true;
-    const slide = document.querySelector(`.slide:nth-child(${idx + 1})`);
-    const flash = slide ? slide.querySelector('.copied-flash') : null;
-    if (flash) flash.classList.add('active');
+    if (viewMode === 'carousel') {
+      const slide = track.querySelector(`.slide[data-index="${idx}"]`);
+      const flash = slide ? slide.querySelector('.copied-flash') : null;
+      if (flash) flash.classList.add('active');
+    } else {
+      const card = galleryGrid.querySelector(`.gallery-card[data-index="${idx}"]`);
+      const flash = card ? card.querySelector('.copied-flash') : null;
+      if (flash) flash.classList.add('active');
+    }
+
     setTimeout(() => {
       window.webkit.messageHandlers.giphyBridge.postMessage({
         action: 'copy',
@@ -1442,12 +1983,26 @@ local function buildHtml(initialConfig)
     });
   }
 
-  // Input event: only toggles clear button visibility, NO search on input
   input.addEventListener('input', () => {
     clearBtn.style.display = input.value ? 'flex' : 'none';
   });
 
   input.addEventListener('keydown', (e) => {
+    if (e.metaKey && e.key === '1') {
+      e.preventDefault();
+      setViewMode('gallery');
+      return;
+    }
+    if (e.metaKey && e.key === '2') {
+      e.preventDefault();
+      setViewMode('carousel');
+      return;
+    }
+    if (e.metaKey && (e.key === 'm' || e.key === 'M')) {
+      e.preventDefault();
+      setViewMode(viewMode === 'gallery' ? 'carousel' : 'gallery');
+      return;
+    }
     if (e.metaKey && e.key === 'ArrowLeft') {
       e.preventDefault();
       goPrev();
@@ -1473,7 +2028,6 @@ local function buildHtml(initialConfig)
     if (e.key === 'Enter') {
       e.preventDefault();
       if (e.shiftKey || e.metaKey) {
-        // Shift + Enter or Cmd + Enter = poster!
         triggerPost(index);
         return;
       }
@@ -1481,10 +2035,8 @@ local function buildHtml(initialConfig)
       if (!q) return;
       if (isSearching) return;
       if (q === lastSearchedQuery && results.length > 0) {
-        // Query has not changed and results are loaded -> Next GIF!
         goNext();
       } else {
-        // Query changed or first search -> New search!
         doSearch();
       }
       return;
@@ -1511,6 +2063,9 @@ local function buildHtml(initialConfig)
     if (e.key === 'ArrowDown' || e.key === 'Tab') {
       e.preventDefault();
       input.blur();
+      if (results.length > 0) {
+        selectCard(index, true);
+      }
       return;
     }
   });
@@ -1534,7 +2089,6 @@ local function buildHtml(initialConfig)
     window.webkit.messageHandlers.giphyBridge.postMessage({action: 'cancel'});
   };
 
-  // Keyboard navigation when input is NOT focused
   document.addEventListener('keydown', (e) => {
     const isSettingsOpen = (document.getElementById('settings-panel').style.display === 'flex');
     if (isSettingsOpen) {
@@ -1548,49 +2102,136 @@ local function buildHtml(initialConfig)
         document.getElementById('save-settings-btn').click();
         return;
       }
-      return; // Do NOT process carousel navigation when settings panel is open
+      return;
     }
 
     if (document.activeElement === input) return;
 
+    if (e.metaKey && e.key === '1') {
+      e.preventDefault();
+      setViewMode('gallery');
+      return;
+    }
+    if (e.metaKey && e.key === '2') {
+      e.preventDefault();
+      setViewMode('carousel');
+      return;
+    }
+    if (e.metaKey && (e.key === 'm' || e.key === 'M')) {
+      e.preventDefault();
+      setViewMode(viewMode === 'gallery' ? 'carousel' : 'gallery');
+      return;
+    }
     if (e.metaKey && e.key === ',') {
       e.preventDefault();
       toggleSettings();
       return;
     }
-
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      if (e.shiftKey || e.metaKey) {
-        triggerPost(index);
-      } else {
-        if (results.length > 0) {
-          goNext();
-        }
-      }
-    } else if ((e.metaKey && (e.key === 'c' || e.key === 'C')) || e.key === 'c' || e.key === 'C') {
-      e.preventDefault();
-      triggerCopy(index);
-    } else if (e.key === 'ArrowLeft' || (e.metaKey && e.key === 'ArrowLeft')) {
-      e.preventDefault();
-      goPrev();
-    } else if (e.key === 'ArrowRight' || (e.metaKey && e.key === 'ArrowRight')) {
-      e.preventDefault();
-      goNext();
-    } else if ((e.metaKey && (e.key === 'r' || e.key === 'R')) || e.key === 'r' || e.key === 'R') {
+    if (e.metaKey && (e.key === 'r' || e.key === 'R')) {
       e.preventDefault();
       doSearch();
-    } else if (e.key === 'Escape') {
+      return;
+    }
+    if (e.key === 'Escape') {
       window.webkit.messageHandlers.giphyBridge.postMessage({action: 'cancel'});
-    } else if (e.key === '/' || (e.metaKey && (e.key === 'f' || e.key === 'F'))) {
+      return;
+    }
+    if (e.key === '/' || (e.metaKey && (e.key === 'f' || e.key === 'F'))) {
       e.preventDefault();
       input.focus();
       input.select();
+      return;
     }
+
+    if (viewMode === 'gallery') {
+      if (e.key === 'ArrowRight' || (e.metaKey && e.key === 'ArrowRight')) {
+        e.preventDefault();
+        goNext();
+        return;
+      }
+      if (e.key === 'ArrowLeft' || (e.metaKey && e.key === 'ArrowLeft')) {
+        e.preventDefault();
+        goPrev();
+        return;
+      }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (index + 5 < results.length) {
+          selectCard(index + 5, true);
+        } else if (hasMore && !isLoadingMore) {
+          loadMoreGifs();
+        }
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (index < 5) {
+          input.focus();
+          input.select();
+        } else {
+          selectCard(index - 5, true);
+        }
+        return;
+      }
+      if (e.key === ' ') {
+        e.preventDefault();
+        setViewMode('carousel');
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (e.shiftKey || e.metaKey) {
+          triggerPost(index);
+        } else {
+          triggerCopy(index);
+        }
+        return;
+      }
+      if ((e.metaKey && (e.key === 'c' || e.key === 'C')) || e.key === 'c' || e.key === 'C') {
+        e.preventDefault();
+        triggerCopy(index);
+        return;
+      }
+    } else {
+      if (e.key === 'ArrowRight' || (e.metaKey && e.key === 'ArrowRight')) {
+        e.preventDefault();
+        goNext();
+        return;
+      }
+      if (e.key === 'ArrowLeft' || (e.metaKey && e.key === 'ArrowLeft')) {
+        e.preventDefault();
+        goPrev();
+        return;
+      }
+      if (e.key === ' ') {
+        e.preventDefault();
+        goNext();
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (e.shiftKey || e.metaKey) {
+          triggerPost(index);
+        } else {
+          if (results.length > 0) goNext();
+        }
+        return;
+      }
+      if ((e.metaKey && (e.key === 'c' || e.key === 'C')) || e.key === 'c' || e.key === 'C') {
+        e.preventDefault();
+        triggerCopy(index);
+        return;
+      }
+    }
+
     const num = parseInt(e.key, 10);
     if (!isNaN(num) && num >= 1 && num <= results.length) {
       index = num - 1;
-      render();
+      if (viewMode === 'carousel') {
+        renderCarousel();
+      } else {
+        selectCard(index, true);
+      }
     }
   });
 
@@ -1898,6 +2539,10 @@ local function buildHtml(initialConfig)
     input.blur();
     document.getElementById('cfg-logging').checked = activeConfig.consoleLogging;
     document.getElementById('cfg-apikey').value = activeConfig.apiKey || '';
+    const defaultViewEl = document.getElementById('cfg-defaultview');
+    if (defaultViewEl) {
+      defaultViewEl.value = activeConfig.defaultView || 'gallery';
+    }
     pendingHotkey = {
       mods: (activeConfig.hotkey && activeConfig.hotkey.mods) ? activeConfig.hotkey.mods.slice() : ['cmd', 'shift'],
       key: (activeConfig.hotkey && activeConfig.hotkey.key) ? activeConfig.hotkey.key : 'g'
@@ -1947,6 +2592,8 @@ local function buildHtml(initialConfig)
   document.getElementById('save-settings-btn').addEventListener('click', () => {
     const loggingChecked = document.getElementById('cfg-logging').checked;
     const apiKeyVal = document.getElementById('cfg-apikey').value.trim();
+    const defaultViewEl = document.getElementById('cfg-defaultview');
+    const defaultViewVal = defaultViewEl ? defaultViewEl.value : 'gallery';
 
     if (!pendingHotkey.mods || pendingHotkey.mods.length === 0) {
       hotkeyError.textContent = 'Au moins un modificateur (⌘, ⌥, ⌃ ou ⇧) est requis.';
@@ -1965,7 +2612,8 @@ local function buildHtml(initialConfig)
       config: {
         consoleLogging: loggingChecked,
         apiKey: apiKeyVal,
-        hotkey: pendingHotkey
+        hotkey: pendingHotkey,
+        defaultView: defaultViewVal
       }
     });
   });
@@ -1978,6 +2626,11 @@ local function buildHtml(initialConfig)
     }
     if (newConfig) {
       activeConfig = newConfig;
+      if (newConfig.defaultView) {
+        activeConfig.defaultView = newConfig.defaultView;
+        const defaultViewEl = document.getElementById('cfg-defaultview');
+        if (defaultViewEl) defaultViewEl.value = activeConfig.defaultView;
+      }
       pendingHotkey = {
         mods: (activeConfig.hotkey && activeConfig.hotkey.mods) ? activeConfig.hotkey.mods.slice() : ['cmd', 'shift'],
         key: (activeConfig.hotkey && activeConfig.hotkey.key) ? activeConfig.hotkey.key : 'g'
@@ -2097,6 +2750,10 @@ function M.trigger()
                 end
             end
 
+            if cfg.defaultView and (cfg.defaultView == "gallery" or cfg.defaultView == "carousel") then
+                hs.settings.set(SETTINGS_KEY_DEFAULT_VIEW, cfg.defaultView)
+            end
+
             if hotkeyErrorMsg then
                 hs.alert.show("Erreur: raccourci invalide ou en conflit", 2)
                 if currentWebview then
@@ -2119,42 +2776,53 @@ function M.trigger()
                 local savedCfg = {
                     consoleLogging = isConsoleLogging(),
                     apiKey = getApiKey() or "",
-                    hotkey = getHotkeyConfig()
+                    hotkey = getHotkeyConfig(),
+                    defaultView = getDefaultViewMode()
                 }
                 currentWebview:evaluateJavaScript(string.format("window.onConfigSaved(true, %s)", hs.json.encode(savedCfg)))
             end
             local totalSaveMs = (hs.timer.absoluteTime() - tSaveStart) / 1000000.0
             logTiming("Configuration save completed", totalSaveMs)
+        elseif action == "setDefaultView" then
+            local mode = body.mode
+            if mode == "gallery" or mode == "carousel" then
+                hs.settings.set(SETTINGS_KEY_DEFAULT_VIEW, mode)
+                log(string.format("Default view mode set to: %s", mode))
+            end
         elseif action == "search" then
             local query = body.query or ""
             local seq = body.seq or 0
+            local offset = tonumber(body.offset) or 0
+            local isAppend = (body.append == true)
             local tSearchDispatch = hs.timer.absoluteTime()
-            log(string.format("─── Search initiated: '%s' (seq=%d) ───", query, seq))
+            log(string.format("─── Search initiated: '%s' (seq=%d, offset=%d, append=%s) ───", query, seq, offset, tostring(isAppend)))
             if not apiKey or apiKey == "" then
                 log("[WARN] No API key configured, displaying notice")
                 if currentWebview then
                     currentWebview:evaluateJavaScript(string.format(
-                        "window.onGiphyResults([], %s, %d)",
+                        "window.onGiphyResults([], %s, %d, %s)",
                         hs.json.encode("Veuillez configurer votre clé API dans les paramètres ⚙️"),
-                        seq
+                        seq,
+                        tostring(isAppend)
                     ))
                 end
                 return
             end
-            fetchGifs(query, apiKey, function(results, err)
+            fetchGifs(query, apiKey, offset, function(results, err)
                 if currentWebview then
                     local tInjectStart = hs.timer.absoluteTime()
                     local errJson = err and hs.json.encode(err) or "null"
                     local js = string.format(
-                        "window.onGiphyResults(%s, %s, %d)",
+                        "window.onGiphyResults(%s, %s, %d, %s)",
                         hs.json.encode(results or {}),
                         errJson,
-                        seq
+                        seq,
+                        tostring(isAppend)
                     )
                     currentWebview:evaluateJavaScript(js)
                     local injectMs = (hs.timer.absoluteTime() - tInjectStart) / 1000000.0
                     local totalSearchMs = (hs.timer.absoluteTime() - tSearchDispatch) / 1000000.0
-                    logTiming("Results injected in WKWebView", injectMs, string.format("total search: %s", formatDuration(totalSearchMs)))
+                    logTiming("Results injected in WKWebView", injectMs, string.format("total search: %s, count: %d", formatDuration(totalSearchMs), results and #results or 0))
                 end
             end)
         elseif action == "post" then
@@ -2216,7 +2884,8 @@ function M.trigger()
         consoleLogging = isConsoleLogging(),
         apiKey = apiKey,
         hotkey = getHotkeyConfig(),
-        openSettings = openSettings
+        openSettings = openSettings,
+        defaultView = getDefaultViewMode()
     }
 
     local html = buildHtml(initialConfig)
