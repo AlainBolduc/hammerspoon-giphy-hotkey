@@ -1375,7 +1375,7 @@ local function buildHtml(initialConfig)
       <span id="empty-msg" class="state-title">Aucun résultat</span>
     </div>
   </main>
-  <footer id="controls">
+  <footer id="controls" style="display: none;">
     <div class="nav-group">
       <button id="prev" class="btn-ghost icon-nav-btn" disabled title="Précédent (⌘←)">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
@@ -1556,6 +1556,7 @@ local function buildHtml(initialConfig)
   const welcomeState = document.getElementById('welcome-state');
   const emptyState = document.getElementById('empty-state');
   const emptyMsg = document.getElementById('empty-msg');
+  const controlsFooter = document.getElementById('controls');
   const prevBtn = document.getElementById('prev');
   const nextBtn = document.getElementById('next');
   const copyBtn = document.getElementById('copy');
@@ -1775,7 +1776,19 @@ local function buildHtml(initialConfig)
 
   function updateControlsUI() {
     const total = results.length;
+    if (viewMode === 'gallery') {
+      controlsFooter.style.display = 'none';
+      if (total === 0) {
+        counter.style.display = 'none';
+      } else {
+        counter.style.display = 'inline-flex';
+        counter.textContent = (index + 1) + ' / ' + total;
+      }
+      return;
+    }
+
     if (total === 0) {
+      controlsFooter.style.display = 'none';
       counter.style.display = 'none';
       prevBtn.disabled = true;
       nextBtn.disabled = true;
@@ -1784,6 +1797,7 @@ local function buildHtml(initialConfig)
       return;
     }
 
+    controlsFooter.style.display = 'flex';
     counter.style.display = 'inline-flex';
     counter.textContent = (index + 1) + ' / ' + total;
     copyBtn.disabled = false;
