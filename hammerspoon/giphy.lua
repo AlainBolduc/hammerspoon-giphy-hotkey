@@ -10,7 +10,8 @@ local KEYCHAIN_SERVICE = "giphy-hammerspoon"
 local KEYCHAIN_ACCOUNT = os.getenv("USER")
 local RESULT_LIMIT = 25
 local POOL_SIZE = 50
-local MAX_RANDOM_OFFSET = 35
+local MAX_PER_CREATOR = 2
+local MAX_SHUFFLE_OFFSET = 125
 local WINDOW_SIZE = { w = 740, h = 580 }
 
 local SETTINGS_KEY_CONSOLE_LOG = "giphy.consoleLogging"
@@ -229,89 +230,152 @@ local function pickLarge(images)
     return nil
 end
 
-local currentSearchBaseOffset = 0
+local function filterDiverseGifs(data, targetLimit, maxPerAuthor)
+    targetLimit = targetLimit or RESULT_LIMIT
+    maxPerAuthor = maxPerAuthor or MAX_PER_CREATOR
 
-local function fetchGifs(query, apiKey, offset, callback)
-    if type(offset) == "function" then
+    local candidates = {}
+    for _, gif in ipairs(data) do
+        local images = gif.images or {}
+        local preview = pickPreview(images)
+        local large = pickLarge(images)
+        if preview and gif.id and gif.id ~= "" then
+            local short = (gif.bitly_gif_url and gif.bitly_gif_url ~= "" and gif.bitly_gif_url)
+                or (gif.bitly_url and gif.bitly_url ~= "" and gif.bitly_url)
+                or gif.url
+            table.insert(candidates, {
+                id = gif.id,
+                previewUrl = preview,
+                largeUrl = large or preview,
+                shortUrl = short,
+                pageUrl = gif.url,
+                title = gif.title or "",
+                username = gif.username or "",
+            })
+        end
+    end
+
+    -- Pass 1: Select items respecting maxPerAuthor for named uploaders to avoid saturation
+    local results = {}
+    local selectedIds = {}
+    local authorCounts = {}
+
+    for _, item in ipairs(candidates) do
+        local author = item.username
+        local allowed = true
+        if author and author ~= "" then
+            local count = authorCounts[author] or 0
+            if count >= maxPerAuthor then
+                allowed = false
+            end
+        end
+
+        if allowed then
+            table.insert(results, item)
+            selectedIds[item.id] = true
+            if author and author ~= "" then
+                authorCounts[author] = (authorCounts[author] or 0) + 1
+            end
+            if #results >= targetLimit then
+                break
+            end
+        end
+    end
+
+    -- Pass 2: If targetLimit not reached (e.g. few creators exist for tag), backfill with remaining valid items
+    if #results < targetLimit then
+        for _, item in ipairs(candidates) do
+            if not selectedIds[item.id] then
+                table.insert(results, item)
+                selectedIds[item.id] = true
+                if #results >= targetLimit then
+                    break
+                end
+            end
+        end
+    end
+
+    return results, #candidates
+end
+
+local function fetchGifs(query, apiKey, offset, isShuffle, callback)
+    if type(isShuffle) == "function" then
+        callback = isShuffle
+        isShuffle = false
+    elseif type(offset) == "function" then
         callback = offset
         offset = 0
+        isShuffle = false
     end
     offset = tonumber(offset) or 0
     local isInitial = (offset == 0)
 
     local queryTrimmed = query and query:gsub("^%s+", ""):gsub("%s+$", "") or ""
     if queryTrimmed == "" then
-        callback({}, nil)
+        callback({}, nil, { totalCount = 0, nextOffset = 0, hasMore = false, count = 0 })
         return
     end
 
     local tFetchStart = hs.timer.absoluteTime()
-    if isInitial then
-        currentSearchBaseOffset = math.random(0, MAX_RANDOM_OFFSET)
+    local effectiveOffset = offset
+    if isInitial and isShuffle then
+        effectiveOffset = math.random(25, MAX_SHUFFLE_OFFSET)
     end
-    local effectiveOffset = currentSearchBaseOffset + offset
-    local poolLimit = RESULT_LIMIT
+    local poolLimit = POOL_SIZE
 
     local baseUrl = "https://api.giphy.com/v1/gifs/search?api_key=" .. hs.http.encodeForQuery(apiKey)
         .. "&q=" .. hs.http.encodeForQuery(queryTrimmed)
         .. "&limit=" .. poolLimit
 
     local urlWithOffset = baseUrl .. "&offset=" .. effectiveOffset
-    log(string.format("Giphy API request dispatch: offset=%d (base=%d + %d), limit=%d", effectiveOffset, currentSearchBaseOffset, offset, poolLimit))
+    log(string.format("Giphy API request dispatch: offset=%d, limit=%d, shuffle=%s", effectiveOffset, poolLimit, tostring(isShuffle)))
 
     local function parseAndCallback(body, httpDurationMs)
         local tParseStart = hs.timer.absoluteTime()
         local ok, decoded = pcall(hs.json.decode, body)
         if not ok or not decoded then
             log(string.format("[ERROR] Giphy JSON decode failed after %s", formatDuration(httpDurationMs)))
-            callback(nil, "Réponse Giphy invalide")
+            callback(nil, "Réponse Giphy invalide", { totalCount = 0, nextOffset = 0, hasMore = false, count = 0 })
             return
         end
 
         if decoded.meta and decoded.meta.status == 403 then
             log(string.format("[ERROR] Giphy API key rejected (403) after %s", formatDuration(httpDurationMs)))
-            callback(nil, "Clé Giphy invalide (403)")
+            callback(nil, "Clé Giphy invalide (403)", { totalCount = 0, nextOffset = 0, hasMore = false, count = 0 })
             return
         end
 
         local data = decoded.data or {}
+        local pagination = decoded.pagination or {}
         local rawCount = #data
+        local totalCount = tonumber(pagination.total_count) or rawCount
+        local apiCount = tonumber(pagination.count) or rawCount
+        local apiOffset = tonumber(pagination.offset) or effectiveOffset
+        local nextOffset = apiOffset + apiCount
+        local hasMore = (nextOffset < totalCount)
+
         if rawCount == 0 then
             local totalMs = (hs.timer.absoluteTime() - tFetchStart) / 1000000.0
             logTiming("Giphy returned 0 results", totalMs, "query: '" .. queryTrimmed .. "'")
-            callback({}, isInitial and ("Aucun résultat pour « " .. queryTrimmed .. " »") or nil)
+            local meta = { totalCount = totalCount, nextOffset = nextOffset, hasMore = false, count = 0 }
+            callback({}, isInitial and ("Aucun résultat pour « " .. queryTrimmed .. " »") or nil, meta)
             return
         end
 
-        local results = {}
-        for _, gif in ipairs(data) do
-            local images = gif.images or {}
-            local preview = pickPreview(images)
-            local large = pickLarge(images)
-            if preview then
-                local short = (gif.bitly_gif_url and gif.bitly_gif_url ~= "" and gif.bitly_gif_url)
-                    or (gif.bitly_url and gif.bitly_url ~= "" and gif.bitly_url)
-                    or gif.url
-                table.insert(results, {
-                    previewUrl = preview,
-                    largeUrl = large or preview,
-                    shortUrl = short,
-                    pageUrl = gif.url,
-                    title = gif.title or "",
-                })
-                if #results >= RESULT_LIMIT then
-                    break
-                end
-            end
-        end
-
+        local results, validCandidates = filterDiverseGifs(data, RESULT_LIMIT, MAX_PER_CREATOR)
         local parseDurationMs = (hs.timer.absoluteTime() - tParseStart) / 1000000.0
         local totalFetchMs = (hs.timer.absoluteTime() - tFetchStart) / 1000000.0
 
-        logTiming("Giphy JSON parsed", parseDurationMs, string.format("%d raw -> %d results", rawCount, #results))
+        logTiming("Giphy JSON parsed & diversified", parseDurationMs, string.format("%d raw -> %d candidates -> %d results (total in Giphy: %d, hasMore: %s)", rawCount, validCandidates, #results, totalCount, tostring(hasMore)))
         logTiming("Total Giphy API fetch duration", totalFetchMs, string.format("HTTP: %s", formatDuration(httpDurationMs)))
 
-        callback(results, nil)
+        local meta = {
+            totalCount = totalCount,
+            nextOffset = nextOffset,
+            hasMore = hasMore,
+            count = #results
+        }
+        callback(results, nil, meta)
     end
 
     local tHttpStart = hs.timer.absoluteTime()
@@ -323,17 +387,16 @@ local function fetchGifs(query, apiKey, offset, callback)
         if status == 200 then
             local ok, decoded = pcall(hs.json.decode, body)
             local data = (ok and decoded and decoded.data) or {}
-            -- If random offset produced 0 items, fallback to offset 0
-            if #data == 0 and isInitial and currentSearchBaseOffset > 0 then
-                log(string.format("Base offset %d returned 0 items, retrying with offset 0...", currentSearchBaseOffset))
-                currentSearchBaseOffset = 0
+            -- If shuffle offset produced 0 items, fallback to offset 0
+            if #data == 0 and isInitial and isShuffle and effectiveOffset > 0 then
+                log(string.format("Shuffle offset %d returned 0 items, retrying with offset 0...", effectiveOffset))
                 local tRetryStart = hs.timer.absoluteTime()
                 hs.http.asyncGet(baseUrl .. "&offset=0", nil, function(status2, body2)
                     local retryHttpDurationMs = (hs.timer.absoluteTime() - tRetryStart) / 1000000.0
                     local retryBytes = body2 and #body2 or 0
                     logTiming("Retry HTTP response (offset 0)", retryHttpDurationMs, string.format("status %d, %s", status2, formatBytes(retryBytes)))
                     if status2 ~= 200 then
-                        callback(nil, "Erreur Giphy (HTTP " .. tostring(status2) .. ")")
+                        callback(nil, "Erreur Giphy (HTTP " .. tostring(status2) .. ")", { totalCount = 0, nextOffset = 0, hasMore = false, count = 0 })
                         return
                     end
                     parseAndCallback(body2, httpDurationMs + retryHttpDurationMs)
@@ -341,8 +404,11 @@ local function fetchGifs(query, apiKey, offset, callback)
                 return
             end
             parseAndCallback(body, httpDurationMs)
+        elseif status == 429 then
+            log(string.format("[ERROR] Giphy API rate limit exceeded (429) after %s", formatDuration(httpDurationMs)))
+            callback(nil, "Limite de requêtes Giphy atteinte (429)", { totalCount = 0, nextOffset = 0, hasMore = false, count = 0 })
         else
-            callback(nil, "Erreur Giphy (HTTP " .. tostring(status) .. ")")
+            callback(nil, "Erreur Giphy (HTTP " .. tostring(status) .. ")", { totalCount = 0, nextOffset = 0, hasMore = false, count = 0 })
         end
     end)
 end
@@ -762,6 +828,33 @@ local function buildHtml(initialConfig)
     color: var(--text-muted);
     font-size: 11px;
     font-weight: 500;
+  }
+  .gallery-actions {
+    text-align: center;
+    padding: 10px 0 6px;
+  }
+  .gallery-load-more-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 6px 14px;
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-size: 11.5px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+  }
+  .gallery-load-more-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-primary);
+    border-color: var(--border-focus);
+  }
+  #next.loading svg {
+    animation: spin 0.6s linear infinite;
   }
 
   .copy-pill {
@@ -1347,6 +1440,9 @@ local function buildHtml(initialConfig)
         <div class="spinner-sm"></div>
         <span>Chargement de plus de GIFs...</span>
       </div>
+      <div id="gallery-actions" class="gallery-actions" style="display: none;">
+        <button id="gallery-more-btn" class="gallery-load-more-btn" type="button">Charger plus de GIFs (↓)</button>
+      </div>
       <div id="gallery-end-msg" class="gallery-end-msg" style="display: none;">
         <span>Fin des résultats</span>
       </div>
@@ -1519,6 +1615,9 @@ local function buildHtml(initialConfig)
   let isSearching = false;
   let isLoadingMore = false;
   let hasMore = true;
+  let nextApiOffset = 0;
+  let pendingCarouselAdvance = false;
+  const seenIds = new Set();
   let viewMode = (activeConfig.defaultView === 'carousel') ? 'carousel' : 'gallery';
   const reportedImages = new Set();
 
@@ -1565,6 +1664,8 @@ local function buildHtml(initialConfig)
   const galleryView = document.getElementById('gallery-view');
   const galleryGrid = document.getElementById('gallery-grid');
   const galleryLoadingMore = document.getElementById('gallery-loading-more');
+  const galleryActions = document.getElementById('gallery-actions');
+  const galleryMoreBtn = document.getElementById('gallery-more-btn');
   const galleryEndMsg = document.getElementById('gallery-end-msg');
   const viewBtnGallery = document.getElementById('view-btn-gallery');
   const viewBtnCarousel = document.getElementById('view-btn-carousel');
@@ -1592,11 +1693,17 @@ local function buildHtml(initialConfig)
       if (results.length > 0) {
         carouselView.style.display = 'none';
         galleryView.style.display = 'flex';
+        if (galleryActions) {
+          galleryActions.style.display = (hasMore && !isLoadingMore) ? 'block' : 'none';
+        }
         selectCard(index, false);
       }
     } else {
       viewBtnCarousel.classList.add('active');
       viewBtnGallery.classList.remove('active');
+      if (galleryActions) {
+        galleryActions.style.display = 'none';
+      }
       if (results.length > 0) {
         galleryView.style.display = 'none';
         carouselView.style.display = 'flex';
@@ -1617,6 +1724,13 @@ local function buildHtml(initialConfig)
 
   viewBtnGallery.addEventListener('click', () => setViewMode('gallery'));
   viewBtnCarousel.addEventListener('click', () => setViewMode('carousel'));
+  if (galleryMoreBtn) {
+    galleryMoreBtn.addEventListener('click', () => {
+      if (!isLoadingMore && hasMore) {
+        loadMoreGifs();
+      }
+    });
+  }
 
   function createGalleryCard(gif, idx) {
     const card = document.createElement('div');
@@ -1778,6 +1892,9 @@ local function buildHtml(initialConfig)
     const total = results.length;
     if (viewMode === 'gallery') {
       controlsFooter.style.display = 'none';
+      if (galleryActions) {
+        galleryActions.style.display = (total > 0 && hasMore && !isLoadingMore) ? 'block' : 'none';
+      }
       if (total === 0) {
         counter.style.display = 'none';
       } else {
@@ -1803,7 +1920,7 @@ local function buildHtml(initialConfig)
     copyBtn.disabled = false;
     postBtn.disabled = false;
     prevBtn.disabled = total <= 1;
-    nextBtn.disabled = total <= 1;
+    nextBtn.disabled = (total <= 1 && !hasMore);
   }
 
   function goPrev() {
@@ -1818,15 +1935,37 @@ local function buildHtml(initialConfig)
   }
 
   function goNext() {
+    if (results.length === 0) return;
+
     if (results.length > 1) {
-      if (index >= results.length - 2 && hasMore && !isLoadingMore) {
+      // Pre-fetch next page when nearing the end
+      if (index >= results.length - 3 && hasMore && !isLoadingMore) {
         loadMoreGifs();
       }
-      index = (index + 1) % results.length;
-      if (viewMode === 'carousel') {
-        renderCarousel();
+
+      if (index < results.length - 1) {
+        index++;
+        if (viewMode === 'carousel') {
+          renderCarousel();
+        } else {
+          selectCard(index, true);
+        }
       } else {
-        selectCard(index, true);
+        // At the last item of current loaded results
+        if (hasMore) {
+          pendingCarouselAdvance = true;
+          nextBtn.classList.add('loading');
+          if (!isLoadingMore) {
+            loadMoreGifs();
+          }
+        } else {
+          index = 0;
+          if (viewMode === 'carousel') {
+            renderCarousel();
+          } else {
+            selectCard(index, true);
+          }
+        }
       }
     }
   }
@@ -1835,10 +1974,11 @@ local function buildHtml(initialConfig)
     if (isLoadingMore || !hasMore || isSearching || !lastSearchedQuery) return;
     isLoadingMore = true;
     galleryLoadingMore.style.display = 'flex';
+    if (galleryActions) galleryActions.style.display = 'none';
     window.webkit.messageHandlers.giphyBridge.postMessage({
       action: 'search',
       query: lastSearchedQuery,
-      offset: results.length,
+      offset: nextApiOffset,
       append: true,
       seq: searchSeq
     });
@@ -1846,16 +1986,17 @@ local function buildHtml(initialConfig)
 
   galleryView.addEventListener('scroll', () => {
     if (viewMode !== 'gallery') return;
-    if (galleryView.scrollHeight - galleryView.scrollTop - galleryView.clientHeight < 140) {
+    if (galleryView.scrollHeight - galleryView.scrollTop - galleryView.clientHeight < 200) {
       loadMoreGifs();
     }
   });
 
-  function setResults(newResults, err, isAppend) {
+  function setResults(newResults, err, isAppend, meta) {
     isSearching = false;
     isLoadingMore = false;
     spinner.style.display = 'none';
     galleryLoadingMore.style.display = 'none';
+    nextBtn.classList.remove('loading');
     clearBtn.style.display = input.value ? 'flex' : 'none';
 
     if (err) {
@@ -1867,45 +2008,93 @@ local function buildHtml(initialConfig)
         emptyMsg.textContent = err;
         carouselView.style.display = 'none';
         galleryView.style.display = 'none';
+        if (galleryActions) galleryActions.style.display = 'none';
         updateControlsUI();
       }
       return;
     }
 
+    if (meta && typeof meta.nextOffset === 'number') {
+      nextApiOffset = meta.nextOffset;
+    } else {
+      nextApiOffset += 50;
+    }
+
+    if (meta && typeof meta.hasMore === 'boolean') {
+      hasMore = meta.hasMore;
+    }
+
+    const uniqueResults = [];
+    if (Array.isArray(newResults)) {
+      for (let i = 0; i < newResults.length; i++) {
+        const item = newResults[i];
+        if (item && item.id) {
+          if (seenIds.has(item.id)) continue;
+          seenIds.add(item.id);
+        }
+        uniqueResults.push(item);
+      }
+    }
+
     if (isAppend) {
-      if (!newResults || newResults.length === 0) {
-        hasMore = false;
-        galleryEndMsg.style.display = 'block';
+      if (uniqueResults.length === 0) {
+        if (hasMore) {
+          // If candidates in this batch were duplicates, auto-fetch next batch
+          loadMoreGifs();
+        } else {
+          hasMore = false;
+          galleryEndMsg.style.display = 'block';
+          if (galleryActions) galleryActions.style.display = 'none';
+          if (pendingCarouselAdvance) {
+            pendingCarouselAdvance = false;
+            index = 0;
+            if (viewMode === 'carousel') renderCarousel();
+            else selectCard(index, true);
+          }
+        }
         return;
       }
-      if (newResults.length < 25) {
-        hasMore = false;
+
+      if (!hasMore) {
         galleryEndMsg.style.display = 'block';
+        if (galleryActions) galleryActions.style.display = 'none';
+      } else if (galleryActions && viewMode === 'gallery') {
+        galleryActions.style.display = 'block';
       }
 
       const startIndex = results.length;
-      results = results.concat(newResults);
+      results = results.concat(uniqueResults);
 
       const gridFrag = document.createDocumentFragment();
-      for (let i = 0; i < newResults.length; i++) {
-        gridFrag.appendChild(createGalleryCard(newResults[i], startIndex + i));
+      for (let i = 0; i < uniqueResults.length; i++) {
+        gridFrag.appendChild(createGalleryCard(uniqueResults[i], startIndex + i));
       }
       galleryGrid.appendChild(gridFrag);
 
       const trackFrag = document.createDocumentFragment();
-      for (let i = 0; i < newResults.length; i++) {
-        trackFrag.appendChild(createCarouselSlide(newResults[i], startIndex + i));
+      for (let i = 0; i < uniqueResults.length; i++) {
+        trackFrag.appendChild(createCarouselSlide(uniqueResults[i], startIndex + i));
       }
       track.appendChild(trackFrag);
 
-      updateControlsUI();
-      if (viewMode === 'carousel') {
-        updatePreloads();
+      if (pendingCarouselAdvance) {
+        pendingCarouselAdvance = false;
+        index = startIndex;
+        if (viewMode === 'carousel') {
+          renderCarousel();
+        } else {
+          selectCard(index, true);
+        }
+      } else {
+        updateControlsUI();
+        if (viewMode === 'carousel') {
+          updatePreloads();
+        }
       }
       return;
     }
 
-    if (!newResults || newResults.length === 0) {
+    if (uniqueResults.length === 0) {
       results = [];
       lastSearchedQuery = '';
       welcomeState.style.display = 'none';
@@ -1913,15 +2102,19 @@ local function buildHtml(initialConfig)
       emptyMsg.textContent = 'Aucun résultat';
       carouselView.style.display = 'none';
       galleryView.style.display = 'none';
+      if (galleryActions) galleryActions.style.display = 'none';
       updateControlsUI();
       return;
     }
 
     reportedImages.clear();
-    results = newResults;
+    results = uniqueResults;
     index = 0;
-    hasMore = (results.length >= 25);
-    galleryEndMsg.style.display = 'none';
+    pendingCarouselAdvance = false;
+    galleryEndMsg.style.display = hasMore ? 'none' : 'block';
+    if (galleryActions) {
+      galleryActions.style.display = (viewMode === 'gallery' && hasMore) ? 'block' : 'none';
+    }
     welcomeState.style.display = 'none';
     emptyState.style.display = 'none';
 
@@ -1945,17 +2138,24 @@ local function buildHtml(initialConfig)
     renderCarousel();
   }
 
-  window.onGiphyResults = function(data, err, seq, isAppend) {
+  window.onGiphyResults = function(data, err, seq, isAppend, meta) {
     if (seq !== searchSeq) return;
-    setResults(data, err, isAppend === true || isAppend === 'true');
+    setResults(data, err, isAppend === true || isAppend === 'true', meta);
   };
 
-  function doSearch() {
+  function doSearch(isShuffle) {
     const q = input.value.trim();
     if (!q) return;
     lastSearchedQuery = q;
     isSearching = true;
+    isLoadingMore = false;
+    hasMore = true;
     searchSeq++;
+    nextApiOffset = 0;
+    seenIds.clear();
+    pendingCarouselAdvance = false;
+    if (galleryActions) galleryActions.style.display = 'none';
+    galleryEndMsg.style.display = 'none';
     spinner.style.display = 'block';
     welcomeState.style.display = 'none';
     emptyState.style.display = 'none';
@@ -1964,7 +2164,8 @@ local function buildHtml(initialConfig)
       query: q,
       offset: 0,
       append: false,
-      seq: searchSeq
+      seq: searchSeq,
+      shuffle: !!isShuffle
     });
   }
 
@@ -2029,7 +2230,7 @@ local function buildHtml(initialConfig)
     }
     if (e.metaKey && (e.key === 'r' || e.key === 'R')) {
       e.preventDefault();
-      doSearch();
+      doSearch(true);
       return;
     }
     if (e.metaKey && (e.key === 'c' || e.key === 'C')) {
@@ -2051,7 +2252,7 @@ local function buildHtml(initialConfig)
       if (q === lastSearchedQuery && results.length > 0) {
         goNext();
       } else {
-        doSearch();
+        doSearch(false);
       }
       return;
     }
@@ -2085,7 +2286,7 @@ local function buildHtml(initialConfig)
   });
 
   loupeIcon.addEventListener('click', () => {
-    doSearch();
+    doSearch(false);
   });
 
   clearBtn.addEventListener('click', () => {
@@ -2143,7 +2344,7 @@ local function buildHtml(initialConfig)
     }
     if (e.metaKey && (e.key === 'r' || e.key === 'R')) {
       e.preventDefault();
-      doSearch();
+      doSearch(true);
       return;
     }
     if (e.key === 'Escape') {
@@ -2172,8 +2373,11 @@ local function buildHtml(initialConfig)
         e.preventDefault();
         if (index + 5 < results.length) {
           selectCard(index + 5, true);
-        } else if (hasMore && !isLoadingMore) {
-          loadMoreGifs();
+        } else if (hasMore) {
+          pendingCarouselAdvance = true;
+          if (!isLoadingMore) {
+            loadMoreGifs();
+          }
         }
         return;
       }
@@ -2808,13 +3012,14 @@ function M.trigger()
             local seq = body.seq or 0
             local offset = tonumber(body.offset) or 0
             local isAppend = (body.append == true)
+            local isShuffle = (body.shuffle == true)
             local tSearchDispatch = hs.timer.absoluteTime()
-            log(string.format("─── Search initiated: '%s' (seq=%d, offset=%d, append=%s) ───", query, seq, offset, tostring(isAppend)))
+            log(string.format("─── Search initiated: '%s' (seq=%d, offset=%d, append=%s, shuffle=%s) ───", query, seq, offset, tostring(isAppend), tostring(isShuffle)))
             if not apiKey or apiKey == "" then
                 log("[WARN] No API key configured, displaying notice")
                 if currentWebview then
                     currentWebview:evaluateJavaScript(string.format(
-                        "window.onGiphyResults([], %s, %d, %s)",
+                        "window.onGiphyResults([], %s, %d, %s, {})",
                         hs.json.encode("Veuillez configurer votre clé API dans les paramètres ⚙️"),
                         seq,
                         tostring(isAppend)
@@ -2822,21 +3027,23 @@ function M.trigger()
                 end
                 return
             end
-            fetchGifs(query, apiKey, offset, function(results, err)
+            fetchGifs(query, apiKey, offset, isShuffle, function(results, err, meta)
                 if currentWebview then
                     local tInjectStart = hs.timer.absoluteTime()
                     local errJson = err and hs.json.encode(err) or "null"
+                    local metaJson = hs.json.encode(meta or {})
                     local js = string.format(
-                        "window.onGiphyResults(%s, %s, %d, %s)",
+                        "window.onGiphyResults(%s, %s, %d, %s, %s)",
                         hs.json.encode(results or {}),
                         errJson,
                         seq,
-                        tostring(isAppend)
+                        tostring(isAppend),
+                        metaJson
                     )
                     currentWebview:evaluateJavaScript(js)
                     local injectMs = (hs.timer.absoluteTime() - tInjectStart) / 1000000.0
                     local totalSearchMs = (hs.timer.absoluteTime() - tSearchDispatch) / 1000000.0
-                    logTiming("Results injected in WKWebView", injectMs, string.format("total search: %s, count: %d", formatDuration(totalSearchMs), results and #results or 0))
+                    logTiming("Results injected in WKWebView", injectMs, string.format("total search: %s, count: %d, hasMore: %s", formatDuration(totalSearchMs), results and #results or 0, tostring(meta and meta.hasMore)))
                 end
             end)
         elseif action == "post" then
