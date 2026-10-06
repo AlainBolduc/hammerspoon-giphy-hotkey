@@ -81,6 +81,17 @@ local function safeJsonEncode(val)
     return "null"
 end
 
+local function getHeader(headers, name)
+    if not headers or type(headers) ~= "table" then return nil end
+    local lowerName = name:lower()
+    for k, v in pairs(headers) do
+        if tostring(k):lower() == lowerName then
+            return tostring(v)
+        end
+    end
+    return nil
+end
+
 local function log(msg)
     local timestamp = getTimestamp()
     local fileLine = os.date("%Y-%m-%d ") .. timestamp .. " " .. msg
@@ -397,7 +408,7 @@ local function fetchGifs(query, apiKey, offset, isShuffle, callback)
     end
 
     local tHttpStart = hs.timer.absoluteTime()
-    hs.http.asyncGet(urlWithOffset, nil, function(status, body)
+    hs.http.asyncGet(urlWithOffset, nil, function(status, body, headers)
         local httpDurationMs = (hs.timer.absoluteTime() - tHttpStart) / 1000000.0
         local bodyBytes = body and #body or 0
         logTiming("Giphy API HTTP response", httpDurationMs, string.format("status %d, %s", status, formatBytes(bodyBytes)))
@@ -409,7 +420,7 @@ local function fetchGifs(query, apiKey, offset, isShuffle, callback)
             if #data == 0 and isInitial and isShuffle and effectiveOffset > 0 then
                 log(string.format("Shuffle offset %d returned 0 items, retrying with offset 0...", effectiveOffset))
                 local tRetryStart = hs.timer.absoluteTime()
-                hs.http.asyncGet(baseUrl .. "&offset=0", nil, function(status2, body2)
+                hs.http.asyncGet(baseUrl .. "&offset=0", nil, function(status2, body2, headers2)
                     local retryHttpDurationMs = (hs.timer.absoluteTime() - tRetryStart) / 1000000.0
                     local retryBytes = body2 and #body2 or 0
                     logTiming("Retry HTTP response (offset 0)", retryHttpDurationMs, string.format("status %d, %s", status2, formatBytes(retryBytes)))
@@ -423,8 +434,37 @@ local function fetchGifs(query, apiKey, offset, isShuffle, callback)
             end
             parseAndCallback(body, httpDurationMs)
         elseif status == 429 then
-            log(string.format("[ERROR] Giphy API rate limit exceeded (429) after %s", formatDuration(httpDurationMs)))
-            callback(nil, "Limite de requêtes Giphy atteinte (429). Réessayez dans quelques minutes.", { totalCount = 0, nextOffset = 0, hasMore = false, count = 0 })
+            local retryAfterRaw = getHeader(headers, "retry-after")
+            local retrySeconds = tonumber(retryAfterRaw)
+            log(string.format("[ERROR] Giphy API rate limit exceeded (429, Retry-After: %s) after %s", tostring(retryAfterRaw), formatDuration(httpDurationMs)))
+
+            local nowTable = os.date("*t")
+            local minutesUntilNextHour = 60 - (nowTable.min or 0)
+            local nextHourTime = string.format("%02d:00", ((nowTable.hour or 0) + 1) % 24)
+
+            local meta = {
+                totalCount = 0,
+                nextOffset = 0,
+                hasMore = false,
+                count = 0,
+                isRateLimit = true,
+                statusCode = 429,
+                retryAfter = retryAfterRaw or "0",
+                retrySeconds = retrySeconds,
+                minutesUntilNextHour = minutesUntilNextHour,
+                nextHourTime = nextHourTime
+            }
+
+            local errMsg = "Limite de requêtes Giphy atteinte (429)"
+            if retrySeconds and retrySeconds > 0 then
+                errMsg = string.format("Limite de requêtes Giphy atteinte (429). Réessayez dans %ds (Retry-After: %ds).", retrySeconds, retrySeconds)
+            elseif retryAfterRaw and retryAfterRaw ~= "" then
+                errMsg = string.format("Limite de requêtes Giphy atteinte (429 - Retry-After: %ss). Réinitialisation à %s (~%d min).", retryAfterRaw, nextHourTime, minutesUntilNextHour)
+            else
+                errMsg = string.format("Limite de requêtes Giphy atteinte (429). Réinitialisation à %s (~%d min).", nextHourTime, minutesUntilNextHour)
+            end
+
+            callback(nil, errMsg, meta)
         else
             callback(nil, "Erreur Giphy (HTTP " .. tostring(status) .. ")", { totalCount = 0, nextOffset = 0, hasMore = false, count = 0 })
         end
@@ -1485,8 +1525,9 @@ local function buildHtml(initialConfig)
 
     <!-- Empty error state -->
     <div id="empty-state" class="state-container" style="display: none;">
-      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
+      <svg id="empty-icon" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
       <span id="empty-msg" class="state-title">Aucun résultat</span>
+      <div id="empty-sub" class="state-sub" style="display: none; margin-top: 8px; text-align: center; max-width: 440px;"></div>
     </div>
   </main>
   <footer id="controls" style="display: none;">
@@ -1675,6 +1716,7 @@ local function buildHtml(initialConfig)
   const welcomeState = document.getElementById('welcome-state');
   const emptyState = document.getElementById('empty-state');
   const emptyMsg = document.getElementById('empty-msg');
+  const emptySub = document.getElementById('empty-sub');
   const controlsFooter = document.getElementById('controls');
   const prevBtn = document.getElementById('prev');
   const nextBtn = document.getElementById('next');
@@ -2037,13 +2079,59 @@ local function buildHtml(initialConfig)
         lastSearchedQuery = '';
         welcomeState.style.display = 'none';
         emptyState.style.display = 'flex';
-        emptyMsg.textContent = err;
+        emptyMsg.textContent = (meta && meta.isRateLimit) ? 'Limite de requêtes Giphy atteinte (429)' : err;
+        if (emptySub) {
+          if (meta && meta.isRateLimit) {
+            let retryHtml = '';
+            const retryVal = (meta.retryAfter !== undefined && meta.retryAfter !== null) ? String(meta.retryAfter) : '';
+            const retryNum = (meta.retrySeconds !== undefined && meta.retrySeconds !== null) ? Number(meta.retrySeconds) : null;
+            
+            if (retryVal !== '') {
+              retryHtml += `<div style="display:inline-flex; align-items:center; gap:6px; background:rgba(239, 68, 68, 0.12); border:1px solid rgba(239, 68, 68, 0.3); border-radius:6px; padding:4px 10px; margin-bottom:8px; font-family:monospace; font-size:12px; color:#fca5a5;"><span>En-tête serveur :</span> <strong>Retry-After: ${escapeHtml(retryVal)}${retryNum !== null ? 's' : ''}</strong></div>`;
+            }
+            if (retryNum && retryNum > 0) {
+              retryHtml += `<div>Réessayez dans <span id="rate-countdown" style="font-weight:600; color:var(--text-primary);">${retryNum}s</span>.</div>`;
+            } else {
+              const resetInfo = meta.nextHourTime ? `vers ${escapeHtml(meta.nextHourTime)} (~${meta.minutesUntilNextHour} min)` : 'd\'ici quelques minutes';
+              retryHtml += `<div>Giphy réinitialise généralement les quotas de ses clés gratuites (100 req/h) au début de chaque heure (${resetInfo}).</div>`;
+            }
+            emptySub.innerHTML = retryHtml;
+            emptySub.style.display = 'block';
+
+            if (retryNum && retryNum > 0) {
+              let remaining = retryNum;
+              const countdownEl = document.getElementById('rate-countdown');
+              const timer = setInterval(() => {
+                remaining--;
+                if (countdownEl) {
+                  if (remaining > 0) {
+                    countdownEl.textContent = remaining + 's';
+                  } else {
+                    countdownEl.textContent = 'maintenant !';
+                    clearInterval(timer);
+                  }
+                } else {
+                  clearInterval(timer);
+                }
+              }, 1000);
+            }
+          } else {
+            emptySub.style.display = 'none';
+            emptySub.innerHTML = '';
+          }
+        }
         carouselView.style.display = 'none';
         galleryView.style.display = 'none';
         if (galleryActions) galleryActions.style.display = 'none';
         updateControlsUI();
       } else {
-        galleryEndMsg.innerHTML = '<span style="color: #f87171;">' + escapeHtml(err) + '</span>';
+        if (meta && meta.isRateLimit) {
+          const retryVal = (meta.retryAfter !== undefined && meta.retryAfter !== null) ? String(meta.retryAfter) : '';
+          const resetInfo = meta.nextHourTime ? ` • Quota réinitialisé vers ${escapeHtml(meta.nextHourTime)} (~${meta.minutesUntilNextHour} min)` : '';
+          galleryEndMsg.innerHTML = `<div style="color: #f87171; font-weight: 500;">Limite de requêtes Giphy atteinte (429)</div><div style="font-size: 11px; color: var(--text-muted); margin-top: 3px;">En-tête serveur : <code>Retry-After: ${escapeHtml(retryVal || '0')}${(meta.retrySeconds !== null && meta.retrySeconds !== undefined) ? 's' : ''}</code>${resetInfo}</div>`;
+        } else {
+          galleryEndMsg.innerHTML = '<span style="color: #f87171;">' + escapeHtml(err) + '</span>';
+        }
         galleryEndMsg.style.display = 'block';
         if (galleryActions) galleryActions.style.display = 'none';
         updateControlsUI();
@@ -2193,6 +2281,10 @@ local function buildHtml(initialConfig)
     spinner.style.display = 'block';
     welcomeState.style.display = 'none';
     emptyState.style.display = 'none';
+    if (emptySub) {
+      emptySub.style.display = 'none';
+      emptySub.innerHTML = '';
+    }
     window.webkit.messageHandlers.giphyBridge.postMessage({
       action: 'search',
       query: q,
