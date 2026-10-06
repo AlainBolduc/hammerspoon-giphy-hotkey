@@ -63,6 +63,24 @@ local function formatBytes(bytes)
     end
 end
 
+local function safeJsonEncode(val)
+    if val == nil then return "null" end
+    if type(val) == "string" then
+        local ok, enc = pcall(hs.json.encode, { val })
+        if ok and enc then
+            return enc:sub(2, -2)
+        end
+        return string.format("%q", val)
+    elseif type(val) == "number" or type(val) == "boolean" then
+        return tostring(val)
+    elseif type(val) == "table" then
+        local ok, enc = pcall(hs.json.encode, val)
+        if ok and enc then return enc end
+        return "{}"
+    end
+    return "null"
+end
+
 local function log(msg)
     local timestamp = getTimestamp()
     local fileLine = os.date("%Y-%m-%d ") .. timestamp .. " " .. msg
@@ -406,7 +424,7 @@ local function fetchGifs(query, apiKey, offset, isShuffle, callback)
             parseAndCallback(body, httpDurationMs)
         elseif status == 429 then
             log(string.format("[ERROR] Giphy API rate limit exceeded (429) after %s", formatDuration(httpDurationMs)))
-            callback(nil, "Limite de requêtes Giphy atteinte (429)", { totalCount = 0, nextOffset = 0, hasMore = false, count = 0 })
+            callback(nil, "Limite de requêtes Giphy atteinte (429). Réessayez dans quelques minutes.", { totalCount = 0, nextOffset = 0, hasMore = false, count = 0 })
         else
             callback(nil, "Erreur Giphy (HTTP " .. tostring(status) .. ")", { totalCount = 0, nextOffset = 0, hasMore = false, count = 0 })
         end
@@ -1616,6 +1634,8 @@ local function buildHtml(initialConfig)
   let isLoadingMore = false;
   let hasMore = true;
   let nextApiOffset = 0;
+  let lastLoadMoreTime = 0;
+  const LOAD_MORE_COOLDOWN_MS = 1000;
   let pendingCarouselAdvance = false;
   const seenIds = new Set();
   let viewMode = (activeConfig.defaultView === 'carousel') ? 'carousel' : 'gallery';
@@ -1727,7 +1747,7 @@ local function buildHtml(initialConfig)
   if (galleryMoreBtn) {
     galleryMoreBtn.addEventListener('click', () => {
       if (!isLoadingMore && hasMore) {
-        loadMoreGifs();
+        loadMoreGifs('button');
       }
     });
   }
@@ -1940,7 +1960,7 @@ local function buildHtml(initialConfig)
     if (results.length > 1) {
       // Pre-fetch next page when nearing the end
       if (index >= results.length - 3 && hasMore && !isLoadingMore) {
-        loadMoreGifs();
+        loadMoreGifs('carouselPreload');
       }
 
       if (index < results.length - 1) {
@@ -1956,7 +1976,7 @@ local function buildHtml(initialConfig)
           pendingCarouselAdvance = true;
           nextBtn.classList.add('loading');
           if (!isLoadingMore) {
-            loadMoreGifs();
+            loadMoreGifs('carouselAdvance');
           }
         } else {
           index = 0;
@@ -1970,8 +1990,11 @@ local function buildHtml(initialConfig)
     }
   }
 
-  function loadMoreGifs() {
+  function loadMoreGifs(caller) {
     if (isLoadingMore || !hasMore || isSearching || !lastSearchedQuery) return;
+    const now = Date.now();
+    if (now - lastLoadMoreTime < LOAD_MORE_COOLDOWN_MS) return;
+    lastLoadMoreTime = now;
     isLoadingMore = true;
     galleryLoadingMore.style.display = 'flex';
     if (galleryActions) galleryActions.style.display = 'none';
@@ -1984,11 +2007,19 @@ local function buildHtml(initialConfig)
     });
   }
 
+  let scrollThrottleTimer = null;
   galleryView.addEventListener('scroll', () => {
     if (viewMode !== 'gallery') return;
-    if (galleryView.scrollHeight - galleryView.scrollTop - galleryView.clientHeight < 200) {
-      loadMoreGifs();
-    }
+    if (!hasMore || isLoadingMore || isSearching) return;
+    if (scrollThrottleTimer) return;
+    scrollThrottleTimer = setTimeout(() => {
+      scrollThrottleTimer = null;
+      if (viewMode !== 'gallery' || !hasMore || isLoadingMore || isSearching) return;
+      const distanceFromBottom = galleryView.scrollHeight - galleryView.scrollTop - galleryView.clientHeight;
+      if (galleryView.scrollTop > 80 && distanceFromBottom < 80) {
+        loadMoreGifs('scroll');
+      }
+    }, 200);
   });
 
   function setResults(newResults, err, isAppend, meta) {
@@ -2000,6 +2031,7 @@ local function buildHtml(initialConfig)
     clearBtn.style.display = input.value ? 'flex' : 'none';
 
     if (err) {
+      hasMore = false;
       if (!isAppend) {
         results = [];
         lastSearchedQuery = '';
@@ -2010,15 +2042,17 @@ local function buildHtml(initialConfig)
         galleryView.style.display = 'none';
         if (galleryActions) galleryActions.style.display = 'none';
         updateControlsUI();
+      } else {
+        galleryEndMsg.innerHTML = '<span style="color: #f87171;">' + escapeHtml(err) + '</span>';
+        galleryEndMsg.style.display = 'block';
+        if (galleryActions) galleryActions.style.display = 'none';
+        updateControlsUI();
       }
       return;
     }
 
-    if (meta && typeof meta.nextOffset === 'number') {
-      nextApiOffset = meta.nextOffset;
-    } else {
-      nextApiOffset += 50;
-    }
+    const reportedNextOffset = (meta && typeof meta.nextOffset === 'number') ? meta.nextOffset : 0;
+    nextApiOffset = Math.max(nextApiOffset + 50, reportedNextOffset);
 
     if (meta && typeof meta.hasMore === 'boolean') {
       hasMore = meta.hasMore;
@@ -2038,24 +2072,21 @@ local function buildHtml(initialConfig)
 
     if (isAppend) {
       if (uniqueResults.length === 0) {
-        if (hasMore) {
-          // If candidates in this batch were duplicates, auto-fetch next batch
-          loadMoreGifs();
-        } else {
-          hasMore = false;
-          galleryEndMsg.style.display = 'block';
-          if (galleryActions) galleryActions.style.display = 'none';
-          if (pendingCarouselAdvance) {
-            pendingCarouselAdvance = false;
-            index = 0;
-            if (viewMode === 'carousel') renderCarousel();
-            else selectCard(index, true);
-          }
+        hasMore = false;
+        galleryEndMsg.textContent = 'Fin des résultats';
+        galleryEndMsg.style.display = 'block';
+        if (galleryActions) galleryActions.style.display = 'none';
+        if (pendingCarouselAdvance) {
+          pendingCarouselAdvance = false;
+          index = 0;
+          if (viewMode === 'carousel') renderCarousel();
+          else selectCard(index, true);
         }
         return;
       }
 
       if (!hasMore) {
+        galleryEndMsg.textContent = 'Fin des résultats';
         galleryEndMsg.style.display = 'block';
         if (galleryActions) galleryActions.style.display = 'none';
       } else if (galleryActions && viewMode === 'gallery') {
@@ -2111,6 +2142,7 @@ local function buildHtml(initialConfig)
     results = uniqueResults;
     index = 0;
     pendingCarouselAdvance = false;
+    galleryEndMsg.textContent = 'Fin des résultats';
     galleryEndMsg.style.display = hasMore ? 'none' : 'block';
     if (galleryActions) {
       galleryActions.style.display = (viewMode === 'gallery' && hasMore) ? 'block' : 'none';
@@ -2152,9 +2184,11 @@ local function buildHtml(initialConfig)
     hasMore = true;
     searchSeq++;
     nextApiOffset = 0;
+    lastLoadMoreTime = 0;
     seenIds.clear();
     pendingCarouselAdvance = false;
     if (galleryActions) galleryActions.style.display = 'none';
+    galleryEndMsg.textContent = 'Fin des résultats';
     galleryEndMsg.style.display = 'none';
     spinner.style.display = 'block';
     welcomeState.style.display = 'none';
@@ -2376,7 +2410,7 @@ local function buildHtml(initialConfig)
         } else if (hasMore) {
           pendingCarouselAdvance = true;
           if (!isLoadingMore) {
-            loadMoreGifs();
+            loadMoreGifs('arrowDown');
           }
         }
         return;
@@ -2977,7 +3011,7 @@ function M.trigger()
                 if currentWebview then
                     currentWebview:evaluateJavaScript(string.format(
                         "window.onConfigSaved(false, null, %s)",
-                        hs.json.encode(hotkeyErrorMsg)
+                        safeJsonEncode(hotkeyErrorMsg)
                     ))
                 end
                 return
@@ -2997,7 +3031,7 @@ function M.trigger()
                     hotkey = getHotkeyConfig(),
                     defaultView = getDefaultViewMode()
                 }
-                currentWebview:evaluateJavaScript(string.format("window.onConfigSaved(true, %s)", hs.json.encode(savedCfg)))
+                currentWebview:evaluateJavaScript(string.format("window.onConfigSaved(true, %s)", safeJsonEncode(savedCfg)))
             end
             local totalSaveMs = (hs.timer.absoluteTime() - tSaveStart) / 1000000.0
             logTiming("Configuration save completed", totalSaveMs)
@@ -3020,7 +3054,7 @@ function M.trigger()
                 if currentWebview then
                     currentWebview:evaluateJavaScript(string.format(
                         "window.onGiphyResults([], %s, %d, %s, {})",
-                        hs.json.encode("Veuillez configurer votre clé API dans les paramètres ⚙️"),
+                        safeJsonEncode("Veuillez configurer votre clé API dans les paramètres ⚙️"),
                         seq,
                         tostring(isAppend)
                     ))
@@ -3028,22 +3062,27 @@ function M.trigger()
                 return
             end
             fetchGifs(query, apiKey, offset, isShuffle, function(results, err, meta)
-                if currentWebview then
-                    local tInjectStart = hs.timer.absoluteTime()
-                    local errJson = err and hs.json.encode(err) or "null"
-                    local metaJson = hs.json.encode(meta or {})
-                    local js = string.format(
-                        "window.onGiphyResults(%s, %s, %d, %s, %s)",
-                        hs.json.encode(results or {}),
-                        errJson,
-                        seq,
-                        tostring(isAppend),
-                        metaJson
-                    )
-                    currentWebview:evaluateJavaScript(js)
-                    local injectMs = (hs.timer.absoluteTime() - tInjectStart) / 1000000.0
-                    local totalSearchMs = (hs.timer.absoluteTime() - tSearchDispatch) / 1000000.0
-                    logTiming("Results injected in WKWebView", injectMs, string.format("total search: %s, count: %d, hasMore: %s", formatDuration(totalSearchMs), results and #results or 0, tostring(meta and meta.hasMore)))
+                local ok, evalErr = pcall(function()
+                    if currentWebview then
+                        local tInjectStart = hs.timer.absoluteTime()
+                        local errJson = safeJsonEncode(err)
+                        local metaJson = safeJsonEncode(meta or {})
+                        local js = string.format(
+                            "window.onGiphyResults(%s, %s, %d, %s, %s)",
+                            safeJsonEncode(results or {}),
+                            errJson,
+                            seq,
+                            tostring(isAppend),
+                            metaJson
+                        )
+                        currentWebview:evaluateJavaScript(js)
+                        local injectMs = (hs.timer.absoluteTime() - tInjectStart) / 1000000.0
+                        local totalSearchMs = (hs.timer.absoluteTime() - tSearchDispatch) / 1000000.0
+                        logTiming("Results injected in WKWebView", injectMs, string.format("total search: %s, count: %d, hasMore: %s", formatDuration(totalSearchMs), results and #results or 0, tostring(meta and meta.hasMore)))
+                    end
+                end)
+                if not ok then
+                    log(string.format("[ERROR] Failed to inject results into WKWebView: %s", tostring(evalErr)))
                 end
             end)
         elseif action == "post" then
