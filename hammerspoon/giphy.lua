@@ -1640,7 +1640,7 @@ local function buildHtml(initialConfig)
         <span>Copier</span>
         <span class="kbd">⌘C</span>
       </button>
-      <button id="post" class="btn-post" disabled title="Poster le lien court (⇧↵)">
+      <button id="post" class="btn-post" disabled title="Coller le GIF (⇧↵)">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
         <span>Poster</span>
         <span class="kbd">⇧↵</span>
@@ -3300,17 +3300,47 @@ function M.trigger()
             local chosen = body.chosen
             local sessionDuration = currentSessionStart and ((hs.timer.absoluteTime() - currentSessionStart) / 1000000.0) or 0
             closePreview()
-            if chosen and chosen.shortUrl then
-                local url = chosen.shortUrl
-                log(string.format("Post action initiated: '%s'", url))
-                if previousApp then
-                    previousApp:activate()
+            if previousApp then
+                previousApp:activate()
+            end
+            if chosen then
+                local gifUrl = chosen.largeUrl or chosen.previewUrl
+                if gifUrl and gifUrl ~= "" then
+                    log(string.format("Post action initiated for GIF: '%s'", gifUrl))
+                    copyGifToClipboard(gifUrl, function(ok, res)
+                        if ok then
+                            if previousApp then
+                                previousApp:activate()
+                            end
+                            hs.timer.doAfter(0.15, function()
+                                hs.eventtap.keyStroke({ "cmd" }, "v")
+                                local totalPostMs = (hs.timer.absoluteTime() - tActionStart) / 1000000.0
+                                logTiming("Post GIF pasted (Cmd+V)", totalPostMs, string.format("app: '%s', session: %s", previousAppName, formatDuration(sessionDuration)))
+                            end)
+                        else
+                            log("[WARN] Echec telechargement GIF pour collage (" .. tostring(res) .. "), fallback URL")
+                            if chosen.shortUrl then
+                                if previousApp then
+                                    previousApp:activate()
+                                end
+                                hs.timer.doAfter(0.15, function()
+                                    hs.eventtap.keyStrokes(chosen.shortUrl)
+                                    local totalPostMs = (hs.timer.absoluteTime() - tActionStart) / 1000000.0
+                                    logTiming("Post keystrokes fallback injected", totalPostMs, string.format("app: '%s', session: %s", previousAppName, formatDuration(sessionDuration)))
+                                end)
+                            end
+                        end
+                    end)
+                elseif chosen.shortUrl then
+                    if previousApp then
+                        previousApp:activate()
+                    end
+                    hs.timer.doAfter(0.15, function()
+                        hs.eventtap.keyStrokes(chosen.shortUrl)
+                        local totalPostMs = (hs.timer.absoluteTime() - tActionStart) / 1000000.0
+                        logTiming("Post keystrokes injected", totalPostMs, string.format("app: '%s', session: %s", previousAppName, formatDuration(sessionDuration)))
+                    end)
                 end
-                hs.timer.doAfter(0.15, function()
-                    hs.eventtap.keyStrokes(url)
-                    local totalPostMs = (hs.timer.absoluteTime() - tActionStart) / 1000000.0
-                    logTiming("Post keystrokes injected", totalPostMs, string.format("app: '%s', session: %s", previousAppName, formatDuration(sessionDuration)))
-                end)
             else
                 log("[WARN] Post action called without chosen GIF")
             end
