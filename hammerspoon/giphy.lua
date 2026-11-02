@@ -17,13 +17,22 @@ local WINDOW_SIZE = { w = 740, h = 580 }
 local SETTINGS_KEY_CONSOLE_LOG = "giphy.consoleLogging"
 local SETTINGS_KEY_HOTKEY = "giphy.hotkey"
 local SETTINGS_KEY_DEFAULT_VIEW = "giphy.defaultView"
+local SETTINGS_KEY_NSFW = "giphy.allowNsfw"
 local DEFAULT_HOTKEY = { mods = { "cmd", "shift" }, key = "g" }
+-- Giphy "rating" filter: "r" is the most permissive rating Giphy exposes.
+local RATING_NSFW = "r"
+local RATING_SFW = "g"
 
 local cachedApiKey = nil
 local currentSessionStart = nil
 
 local function isConsoleLogging()
     return hs.settings.get(SETTINGS_KEY_CONSOLE_LOG) == true
+end
+
+-- NSFW is enabled by default: only an explicit `false` disables it.
+local function isNsfwAllowed()
+    return hs.settings.get(SETTINGS_KEY_NSFW) ~= false
 end
 
 local function getDefaultViewMode()
@@ -259,6 +268,85 @@ local function pickLarge(images)
     return nil
 end
 
+--- Copie un GIF anime complet dans le presse-papier macOS (toutes les frames).
+-- @param source string : Chemin local, URL web ou octets binaires GIF.
+-- @param callback function|nil : function(success, errOrPath) optionnel pour mode asynchrone.
+-- @return boolean, string : success et chemin final (ou erreur).
+local function copyGifToClipboard(source, callback)
+    local function writeToPasteboard(data, filePath)
+        if not data or #data < 6 or data:sub(1, 3) ~= "GIF" then
+            return false, "Donnees GIF invalides (en-tete absent)"
+        end
+
+        local finalPath = filePath
+        if not finalPath or finalPath == "" then
+            finalPath = (os.getenv("TMPDIR") or "/tmp/") .. "giphy_clipboard.gif"
+            local f = io.open(finalPath, "wb")
+            if f then
+                f:write(data)
+                f:close()
+            end
+        end
+
+        hs.pasteboard.clearContents()
+        local okGif = hs.pasteboard.writeDataForUTI(nil, "com.compuserve.gif", data, false)
+        local okUrl = hs.pasteboard.writeDataForUTI(nil, "public.file-url", "file://" .. finalPath, true)
+        return (okGif and okUrl), finalPath
+    end
+
+    -- 1. Octets binaires bruts deja en memoire
+    if type(source) == "string" and source:sub(1, 3) == "GIF" then
+        local ok, res = writeToPasteboard(source, nil)
+        if callback then callback(ok, res) end
+        return ok, res
+    end
+
+    -- 2. URL HTTP/HTTPS
+    if type(source) == "string" and source:match("^https?://") then
+        if callback then
+            hs.http.asyncGet(source, nil, function(status, body)
+                if status == 200 and body and #body > 0 then
+                    local ok, res = writeToPasteboard(body, nil)
+                    callback(ok, res)
+                else
+                    callback(false, "Erreur HTTP " .. tostring(status))
+                end
+            end)
+            return true, "Telechargement asynchrone lance"
+        else
+            local status, body = hs.http.get(source)
+            if status == 200 and body and #body > 0 then
+                return writeToPasteboard(body, nil)
+            else
+                return false, "Erreur HTTP " .. tostring(status)
+            end
+        end
+    end
+
+    -- 3. Chemin de fichier local
+    if type(source) == "string" then
+        local path = source:gsub("^~", os.getenv("HOME") or "")
+        local f = io.open(path, "rb")
+        if not f then
+            local err = "Fichier introuvable : " .. path
+            if callback then callback(false, err) end
+            return false, err
+        end
+        local data = f:read("*all")
+        f:close()
+
+        local ok, res = writeToPasteboard(data, path)
+        if callback then callback(ok, res) end
+        return ok, res
+    end
+
+    local err = "Source invalide"
+    if callback then callback(false, err) end
+    return false, err
+end
+
+M.copyGifToClipboard = copyGifToClipboard
+
 local function filterDiverseGifs(data, targetLimit, maxPerAuthor)
     targetLimit = targetLimit or RESULT_LIMIT
     maxPerAuthor = maxPerAuthor or MAX_PER_CREATOR
@@ -336,7 +424,9 @@ local function fetchGifs(query, apiKey, offset, isShuffle, callback)
         offset = 0
         isShuffle = false
     end
-    offset = tonumber(offset) or 0
+    -- Values coming from the JS bridge are Lua floats (50 -> 50.0). Giphy rejects
+    -- "offset=50.0" silently and falls back to offset 0, so force an integer.
+    offset = math.floor(tonumber(offset) or 0)
     local isInitial = (offset == 0)
 
     local queryTrimmed = query and query:gsub("^%s+", ""):gsub("%s+$", "") or ""
@@ -351,13 +441,15 @@ local function fetchGifs(query, apiKey, offset, isShuffle, callback)
         effectiveOffset = math.random(25, MAX_SHUFFLE_OFFSET)
     end
     local poolLimit = POOL_SIZE
+    local rating = isNsfwAllowed() and RATING_NSFW or RATING_SFW
 
     local baseUrl = "https://api.giphy.com/v1/gifs/search?api_key=" .. hs.http.encodeForQuery(apiKey)
         .. "&q=" .. hs.http.encodeForQuery(queryTrimmed)
         .. "&limit=" .. poolLimit
+        .. "&rating=" .. rating
 
-    local urlWithOffset = baseUrl .. "&offset=" .. effectiveOffset
-    log(string.format("Giphy API request dispatch: offset=%d, limit=%d, shuffle=%s", effectiveOffset, poolLimit, tostring(isShuffle)))
+    local urlWithOffset = baseUrl .. string.format("&offset=%d", effectiveOffset)
+    log(string.format("Giphy API request dispatch: offset=%d, limit=%d, rating=%s, shuffle=%s", effectiveOffset, poolLimit, rating, tostring(isShuffle)))
 
     local function parseAndCallback(body, httpDurationMs)
         local tParseStart = hs.timer.absoluteTime()
@@ -1543,7 +1635,7 @@ local function buildHtml(initialConfig)
       </button>
     </div>
     <div class="action-group">
-      <button id="copy" class="btn-copy" disabled title="Copier le lien court (⌘C / Clic)">
+      <button id="copy" class="btn-copy" disabled title="Copier le GIF (⌘C / Clic)">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
         <span>Copier</span>
         <span class="kbd">⌘C</span>
@@ -1589,6 +1681,18 @@ local function buildHtml(initialConfig)
         </div>
         <label class="toggle-switch">
           <input type="checkbox" id="cfg-logging">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <!-- Setting 1b: NSFW content -->
+      <div class="setting-card">
+        <div class="setting-info">
+          <label for="cfg-nsfw" class="setting-label">Contenu NSFW</label>
+          <div class="setting-desc">Inclut les GIFs classés R. Décoché : uniquement les GIFs classés G</div>
+        </div>
+        <label class="toggle-switch">
+          <input type="checkbox" id="cfg-nsfw" checked>
           <span class="toggle-slider"></span>
         </label>
       </div>
@@ -1661,7 +1765,8 @@ local function buildHtml(initialConfig)
     consoleLogging: false,
     apiKey: '',
     hotkey: { mods: ['cmd', 'shift'], key: 'g' },
-    defaultView: 'gallery'
+    defaultView: 'gallery',
+    allowNsfw: true
   };
   let pendingHotkey = Object.assign({}, activeConfig.hotkey);
   let isRecordingHotkey = false;
@@ -1806,7 +1911,7 @@ local function buildHtml(initialConfig)
       </div>
       <div class="gallery-card-overlay">
         <div class="gallery-card-actions">
-          <button type="button" class="gallery-btn gallery-btn-copy" title="Copier le lien court (⌘C)">
+          <button type="button" class="gallery-btn gallery-btn-copy" title="Copier le GIF (⌘C)">
             <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
             <span>Copier</span>
           </button>
@@ -2882,6 +2987,7 @@ local function buildHtml(initialConfig)
   function openSettings() {
     input.blur();
     document.getElementById('cfg-logging').checked = activeConfig.consoleLogging;
+    document.getElementById('cfg-nsfw').checked = activeConfig.allowNsfw !== false;
     document.getElementById('cfg-apikey').value = activeConfig.apiKey || '';
     const defaultViewEl = document.getElementById('cfg-defaultview');
     if (defaultViewEl) {
@@ -2957,7 +3063,8 @@ local function buildHtml(initialConfig)
         consoleLogging: loggingChecked,
         apiKey: apiKeyVal,
         hotkey: pendingHotkey,
-        defaultView: defaultViewVal
+        defaultView: defaultViewVal,
+        allowNsfw: document.getElementById('cfg-nsfw').checked
       }
     });
   });
@@ -2969,6 +3076,7 @@ local function buildHtml(initialConfig)
       return;
     }
     if (newConfig) {
+      const prevNsfw = activeConfig.allowNsfw !== false;
       activeConfig = newConfig;
       if (newConfig.defaultView) {
         activeConfig.defaultView = newConfig.defaultView;
@@ -2980,9 +3088,14 @@ local function buildHtml(initialConfig)
         key: (activeConfig.hotkey && activeConfig.hotkey.key) ? activeConfig.hotkey.key : 'g'
       };
       document.getElementById('cfg-logging').checked = activeConfig.consoleLogging;
+      document.getElementById('cfg-nsfw').checked = activeConfig.allowNsfw !== false;
       document.getElementById('cfg-apikey').value = activeConfig.apiKey || '';
       updateHotkeyUI();
       closeSettings();
+      // Refresh current results so the new rating filter applies right away
+      if (prevNsfw !== (activeConfig.allowNsfw !== false) && lastSearchedQuery && input.value.trim()) {
+        doSearch(false);
+      }
     }
   };
 
@@ -3070,6 +3183,10 @@ function M.trigger()
                 hs.settings.set(SETTINGS_KEY_CONSOLE_LOG, cfg.consoleLogging == true)
             end
 
+            if cfg.allowNsfw ~= nil then
+                hs.settings.set(SETTINGS_KEY_NSFW, cfg.allowNsfw == true)
+            end
+
             if cfg.apiKey and cfg.apiKey ~= "" then
                 local ok, keyDuration = setApiKey(cfg.apiKey)
                 apiKey = cfg.apiKey
@@ -3121,7 +3238,8 @@ function M.trigger()
                     consoleLogging = isConsoleLogging(),
                     apiKey = getApiKey() or "",
                     hotkey = getHotkeyConfig(),
-                    defaultView = getDefaultViewMode()
+                    defaultView = getDefaultViewMode(),
+                    allowNsfw = isNsfwAllowed()
                 }
                 currentWebview:evaluateJavaScript(string.format("window.onConfigSaved(true, %s)", safeJsonEncode(savedCfg)))
             end
@@ -3136,7 +3254,7 @@ function M.trigger()
         elseif action == "search" then
             local query = body.query or ""
             local seq = body.seq or 0
-            local offset = tonumber(body.offset) or 0
+            local offset = math.floor(tonumber(body.offset) or 0)
             local isAppend = (body.append == true)
             local isShuffle = (body.shuffle == true)
             local tSearchDispatch = hs.timer.absoluteTime()
@@ -3201,14 +3319,29 @@ function M.trigger()
             local chosen = body.chosen
             local sessionDuration = currentSessionStart and ((hs.timer.absoluteTime() - currentSessionStart) / 1000000.0) or 0
             closePreview()
-            if chosen and chosen.shortUrl then
-                hs.pasteboard.setContents(chosen.shortUrl)
-                if previousApp then
-                    previousApp:activate()
+            if previousApp then
+                previousApp:activate()
+            end
+            if chosen then
+                local gifUrl = chosen.largeUrl or chosen.previewUrl
+                if gifUrl and gifUrl ~= "" then
+                    copyGifToClipboard(gifUrl, function(ok, res)
+                        local totalCopyMs = (hs.timer.absoluteTime() - tActionStart) / 1000000.0
+                        if ok then
+                            hs.alert.show("GIF copié dans le presse-papier !", 1.5)
+                            logTiming("Copy GIF to pasteboard", totalCopyMs, string.format("session: %s, file: %s", formatDuration(sessionDuration), tostring(res)))
+                        else
+                            log("[WARN] Echec copie binaire GIF (" .. tostring(res) .. "), fallback sur l'URL")
+                            if chosen.shortUrl then
+                                hs.pasteboard.setContents(chosen.shortUrl)
+                                hs.alert.show("Lien copié (échec téléchargement GIF)", 2.0)
+                            end
+                        end
+                    end)
+                elseif chosen.shortUrl then
+                    hs.pasteboard.setContents(chosen.shortUrl)
+                    hs.alert.show("URL copiée dans le presse-papier !", 1.5)
                 end
-                hs.alert.show("URL copiée dans le presse-papier !", 1.5)
-                local totalCopyMs = (hs.timer.absoluteTime() - tActionStart) / 1000000.0
-                logTiming("Copy to pasteboard", totalCopyMs, string.format("session: %s", formatDuration(sessionDuration)))
             else
                 log("[WARN] Copy action called without chosen GIF")
             end
@@ -3237,7 +3370,8 @@ function M.trigger()
         apiKey = apiKey,
         hotkey = getHotkeyConfig(),
         openSettings = openSettings,
-        defaultView = getDefaultViewMode()
+        defaultView = getDefaultViewMode(),
+        allowNsfw = isNsfwAllowed()
     }
 
     local html = buildHtml(initialConfig)

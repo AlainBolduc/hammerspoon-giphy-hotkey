@@ -57,6 +57,18 @@ Both were replaced. Don't reintroduce either without re-reading this section.
 4. **`hs.webview:title()` is not a setter** — it throws "incorrect number
    of arguments" if called with an argument. Use `:windowTitle()` instead.
 
+5. **Numbers from the JS bridge arrive as Lua floats** (`50` → `50.0`).
+   Concatenating them into a URL yields `offset=50.0`, which Giphy silently
+   ignores (returns offset 0) — this broke "load more" (every page was a
+   duplicate of page 1). Always `math.floor()` / `%d` numeric bridge values
+   before putting them in a URL.
+
+6. **Animated GIFs on the clipboard require `com.compuserve.gif`**.
+   Using `hs.image` or `hs.pasteboard.writeObjects(img)` rasterizes only the
+   first frame as a static `public.tiff`. To copy the entire animated GIF,
+   write the raw GIF bytes directly using `hs.pasteboard.writeDataForUTI(nil, "com.compuserve.gif", data, false)`
+   plus `public.file-url` for apps that accept file pastes.
+
 ## Development / debugging
 
 - Edit `hammerspoon/giphy.lua`, then copy to `~/.hammerspoon/giphy.lua` and
